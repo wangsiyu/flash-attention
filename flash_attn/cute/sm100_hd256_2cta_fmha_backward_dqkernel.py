@@ -58,8 +58,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.is_causal = is_causal
         self.window_size_left = window_size_left
         # Keep original behavior (known-good in this repo)
-        window_size_left = None if window_size_left < 0 else cutlass.Int32(window_size_left)
-        window_size_right = None if window_size_right < 0 else cutlass.Int32(window_size_right)
+        window_size_left = None if (window_size_left is None or window_size_left < 0) else cutlass.Int32(window_size_left)
+        window_size_right = None if (window_size_right is None or window_size_right < 0) else cutlass.Int32(window_size_right)
         self.window_size_left = None if self.is_causal else window_size_left
         self.window_size_right = cutlass.Int32(0) if self.is_causal else window_size_right
         assert mma_tiler[0] == 128 and mma_tiler[1] == 128, (

@@ -644,8 +644,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             bwd_grid = self._compute_bwd_grid(problem_shape, self.cta_tiler[1])
             bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
-        print('H>> shared_storage.size_in_bytes(): ', self.shared_storage.size_in_bytes())
-
         self.dkdv_bwd(
             KQ_tiled_mma,
             VdO_tiled_mma,

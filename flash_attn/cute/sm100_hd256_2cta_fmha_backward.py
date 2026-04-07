@@ -118,14 +118,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
         self.varlen = varlen
         self.is_causal = is_causal
         self.mask_type = mask_type
-        self.window_size_left = None if window_size_left < 0 else window_size_left
-        self.window_size_right = None if window_size_right < 0 else window_size_right
-
-
-        print(f'self.is_causal = {self.is_causal}', flush=True)
-        print(f'window_size_left = {window_size_left}', flush=True)
-        print(f'window_size_right = {window_size_right}', flush=True)
-        print(f'mask_type = {mask_type}', flush=True)
+        self.window_size_left = None if (window_size_left is None or window_size_left < 0) else window_size_left
+        self.window_size_right = None if (window_size_right is None or window_size_right < 0) else window_size_right
 
         # =================== Sum OdO ================================
         self.sum_OdO_max_threads_per_block = 128
