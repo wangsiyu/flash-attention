@@ -11,6 +11,7 @@ from cutlass.cutlass_dsl import min as dsl_min
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
+from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
@@ -831,6 +832,87 @@ class Sm100FusedMask:
         return result
 
     @cute.jit
+    def get_trip_start_count_via_block_info(
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        is_causal: cutlass.Constexpr[bool] = False,
+        is_local: cutlass.Constexpr[bool] = False,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
+    ) -> Tuple[Int32, Int32]:
+        block_info = BlockInfo(
+            tile_m=tile_shape[0],
+            tile_n=tile_shape[1],
+            is_causal=is_causal,
+            is_local=is_local and not is_causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+
+        seqlen_info = SeqlenInfoQK(
+            offset_q=Int32(0),
+            offset_k=Int32(0),
+            padded_offset_q=Int32(0),
+            padded_offset_k=Int32(0),
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            has_cu_seqlens_q=False,
+            has_cu_seqlens_k=False,
+            has_seqused_q=False,
+            has_seqused_k=False,
+        )
+        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
+        return n_block_min, n_block_max - n_block_min
+
+    @cute.jit
+    def get_trip_mask_bounds_via_block_info(
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        is_causal: cutlass.Constexpr[bool] = False,
+        is_local: cutlass.Constexpr[bool] = False,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
+    ) -> Tuple[Int32, Int32]:
+        """Return SM100-style mask boundaries for dense iteration.
+
+        Returns:
+          - n_block_min_causal_local_mask: right-side masked region start
+          - n_block_min_before_local_mask: start of fully unmasked middle region
+        """
+        block_info = BlockInfo(
+            tile_m=tile_shape[0],
+            tile_n=tile_shape[1],
+            is_causal=is_causal,
+            is_local=is_local and not is_causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+        seqlen_info = SeqlenInfoQK(
+            offset_q=Int32(0),
+            offset_k=Int32(0),
+            padded_offset_q=Int32(0),
+            padded_offset_k=Int32(0),
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            has_cu_seqlens_q=False,
+            has_cu_seqlens_k=False,
+            has_seqused_q=False,
+            has_seqused_k=False,
+        )
+        n_block_min, _ = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
+        n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+            seqlen_info, blk_coord[0], n_block_min
+        )
+        n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
+            seqlen_info, blk_coord[0], n_block_min
+        )
+        return n_block_min_causal_local_mask, n_block_min_before_local_mask
+
+    @cute.jit
     def get_trip_start(
         mask_type: Sm100MaskEnum,
         blk_coord: cute.Coord,
@@ -1334,3 +1416,57 @@ class Sm100FusedMask:
             ):
                 if index_k >= seqlen_k or index_q >= seqlen_q:
                     acc_qk[i] = -Float32.inf
+
+    @cute.jit
+    def apply_mask_via_causal_local(
+        acc_qk: cute.Tensor,
+        index_qk: cute.Tensor,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        apply_semantic_window: cutlass.Constexpr[bool] = True,
+        is_causal: cutlass.Constexpr[bool] = False,
+        is_local: cutlass.Constexpr[bool] = False,
+        window_size_left: Optional[int] = None,
+        window_size_right: Optional[int] = None,
+        index_transform: cutlass.Constexpr = lambda index_q, index_k: (
+            index_q,
+            index_k,
+        ),
+    ):
+        """Apply forward mask without mask_type.
+
+        - If apply_semantic_window=True, apply causal/local window constraints.
+        - Always apply residual OOB masking (index_k>=seqlen_k or index_q>=seqlen_q).
+        """
+        tidx, tidy, tidx = cute.arch.thread_idx()
+        offset = 0
+        if cutlass.const_expr(apply_semantic_window):
+            # Match WINDOW_MASK_INFERENCE semantics: end-align Q/K when lengths differ.
+            offset = seqlen_k - seqlen_q
+        for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
+            index_q, index_k = index_transform(*index_qk[i])
+            if cutlass.const_expr(apply_semantic_window):
+                if cutlass.const_expr(is_causal and not is_local):
+                    # Pure causal; tolerate both external forms:
+                    # - (None, None) from interface
+                    # - (None, 0) from fused-mask-style callers
+                    right = 0 if const_expr(window_size_right is None) else window_size_right
+                    if index_q + offset + right < index_k:
+                        acc_qk[i] = -Float32.inf
+                elif cutlass.const_expr(
+                    is_local or window_size_left is not None or window_size_right is not None
+                ):
+                    if cutlass.const_expr(window_size_left is None):
+                        if index_q + offset + window_size_right < index_k:
+                            acc_qk[i] = -Float32.inf
+                    elif cutlass.const_expr(window_size_right is None):
+                        if index_q + offset - window_size_left > index_k:
+                            acc_qk[i] = -Float32.inf
+                    else:
+                        max_K_index = dsl_min(index_q + offset + window_size_right, seqlen_k)
+                        min_K_index = max(0, index_q + offset - window_size_left)
+                        if index_k > max_K_index or index_k < min_K_index:
+                            acc_qk[i] = -Float32.inf
+            # Residual mask is always needed for boundary protection.
+            if index_k >= seqlen_k or index_q >= seqlen_q:
+                acc_qk[i] = -Float32.inf

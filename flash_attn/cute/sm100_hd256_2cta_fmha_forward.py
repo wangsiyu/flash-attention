@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 import math
-from typing import Type, Tuple, Optional
+from typing import Tuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -34,13 +34,45 @@ from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 class BlackwellFusedMultiHeadAttentionForward:
     def __init__(
         self,
-        qk_acc_dtype: Type[cutlass.Numeric],
-        pv_acc_dtype: Type[cutlass.Numeric],
-        mma_tiler: Tuple[int, int, int],
-        is_persistent: bool,
-        mask_type: MaskEnum,
+        head_dim: int,
+        head_dim_v: Optional[int] = None,
+        qhead_per_kvhead: int = 1,
+        is_causal: bool = False,
+        is_local: bool = False,
+        is_split_kv: bool = False,
+        pack_gqa: bool = False,
+        q_subtile_factor: int | None = None,
+        m_block_size: int = 128,
+        n_block_size: int = 128,
+        q_stage: int = 2,
+        is_persistent: bool = True,
+        score_mod=None,
+        mask_mod=None,
+        has_aux_tensors: bool = False,
+        paged_kv_non_tma: bool = False,
+        is_varlen_q: bool = False,
+        use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
     ):
+        head_dim_v = head_dim if head_dim_v is None else head_dim_v
+        assert head_dim == 256 and head_dim_v == 256, (
+            "SM100 dedicated kernel only supports (head_dim, head_dim_v) = (256, 256)"
+        )
+        assert score_mod is None, "SM100 forward with head_dim=256 does not support score_mod"
+        assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
+        assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
+        assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
+        assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
+        assert q_subtile_factor is None, "SM100 forward with head_dim=256 does not support q_subtile_factor"
+        assert m_block_size == 128 and n_block_size == 128, (
+            "SM100 dedicated kernel only supports tile_m=128 and tile_n=128"
+        )
+        # q_stage / persistence / scheduler knobs are accepted for interface parity,
+        # but this dedicated kernel uses fixed internal settings.
+
+        qk_acc_dtype = cutlass.Float32
+        pv_acc_dtype = cutlass.Float32
+        mma_tiler = (128, 128, head_dim)
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
         self.mma_tiler = mma_tiler
@@ -68,9 +100,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
         self.cluster_shape_mn = (2, 1)
         self.tmem_warp_shape_mn = (4, 1)
-        self.is_persistent = is_persistent
-        self.mask_type = mask_type
-        self.use_clc_scheduler = use_clc_scheduler
+        # Dedicated hd256 kernel uses fixed scheduling policy.
+        self.is_persistent = False
+        self.is_causal = is_causal
+        self.is_local = is_local
+        self.use_semantic_trip_range = is_causal or is_local
+        self.use_clc_scheduler = False
 
         self.softmax_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
@@ -118,23 +153,111 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def __call__(
         self,
-        q_tensor: cute.Tensor,
-        k_tensor: cute.Tensor,
-        v_tensor: cute.Tensor,
-        o_tensor: cute.Tensor,
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32],
-        cum_seqlen_q: Optional[cute.Tensor],
-        cum_seqlen_k: Optional[cute.Tensor],
-        lse_tensor: Optional[cute.Tensor],
-        scale_softmax_log2: Float32,
-        scale_softmax: Float32,
-        scale_output: Float32,
-        window_size_left: Optional[Int32],
-        window_size_right: Optional[Int32],
-        stream: cuda.CUstream,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        softmax_scale: Float32,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        blocksparse_tensors: Optional[cute.Tensor] = None,
+        aux_tensors: Optional[list] = None,
+        stream: cuda.CUstream = None,
     ):
-        b, s_q, s_k, h_q, h_k, d = problem_size
-        s_lse = q_tensor.shape[1] if cum_seqlen_q is not None else s_q
+        # Keep parity with FlashAttentionForwardSm100.__call__ interface.
+        # (TODO@wangsiyu) Implement these features.
+        assert mSeqUsedQ is None and mSeqUsedK is None, (
+            "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
+        )
+        assert mPageTable is None, (
+            "SM100 forward with head_dim=256 does not support paged KV"
+        )
+        assert learnable_sink is None, (
+            "SM100 forward with head_dim=256 does not support learnable_sink"
+        )
+        assert blocksparse_tensors is None, (
+            "SM100 forward with head_dim=256 does not support block sparsity"
+        )
+        assert aux_tensors is None, (
+            "SM100 forward with head_dim=256 does not support aux_tensors"
+        )
+
+        q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
+        lse_tensor = mLSE
+        cum_seqlen_q = mCuSeqlensQ
+        cum_seqlen_k = mCuSeqlensK
+
+        q_rank = len(mQ.shape)
+        k_rank = len(mK.shape)
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            # Varlen path accepts either legacy 5D tensors or standard 3D tensors.
+            if cutlass.const_expr(q_rank == 5):
+                s_q = mQ.shape[1]
+                h_q = mQ.shape[2] * mQ.shape[3]
+                d = mQ.shape[4]
+            elif cutlass.const_expr(q_rank == 3):
+                s_q = mQ.shape[0]
+                h_q = mQ.shape[1]
+                d = mQ.shape[2]
+            else:
+                raise RuntimeError(
+                    f"hd256 forward varlen expects q rank 3 or 5, got rank {q_rank}"
+                )
+        else:
+            # Non-varlen path accepts either legacy 5D tensors or standard 4D tensors.
+            if cutlass.const_expr(q_rank == 5):
+                s_q = mQ.shape[1]
+                h_q = mQ.shape[2] * mQ.shape[3]
+                d = mQ.shape[4]
+            elif cutlass.const_expr(q_rank == 4):
+                s_q = mQ.shape[1]
+                h_q = mQ.shape[2]
+                d = mQ.shape[3]
+            else:
+                raise RuntimeError(
+                    f"hd256 forward non-varlen expects q rank 4 or 5, got rank {q_rank}"
+                )
+
+        if cutlass.const_expr(cum_seqlen_k is not None):
+            if cutlass.const_expr(k_rank == 5):
+                s_k = mK.shape[1]
+                h_k = mK.shape[2]
+            elif cutlass.const_expr(k_rank == 3):
+                s_k = mK.shape[0]
+                h_k = mK.shape[1]
+            else:
+                raise RuntimeError(
+                    f"hd256 forward varlen expects k rank 3 or 5, got rank {k_rank}"
+                )
+        else:
+            if cutlass.const_expr(k_rank == 5):
+                s_k = mK.shape[1]
+                h_k = mK.shape[2]
+            elif cutlass.const_expr(k_rank == 4):
+                s_k = mK.shape[1]
+                h_k = mK.shape[2]
+            else:
+                raise RuntimeError(
+                    f"hd256 forward non-varlen expects k rank 4 or 5, got rank {k_rank}"
+                )
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            b = mCuSeqlensQ.shape[0] - 1
+        elif cutlass.const_expr(cum_seqlen_k is not None):
+            b = mCuSeqlensK.shape[0] - 1
+        else:
+            b = mQ.shape[0]
+
+        scale_softmax = softmax_scale
+        scale_softmax_log2 = softmax_scale * math.log2(math.exp(1.0))
+        scale_output = 1.0
+        s_lse = s_q
         h_r = h_q // h_k
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
@@ -143,8 +266,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
-        s_q_total = q_tensor.shape[1] if cum_seqlen_q is not None else s_q64
-        s_k_total = k_tensor.shape[1] if cum_seqlen_k is not None else s_k64
+        s_q_total = q_tensor.shape[1] if cum_seqlen_q is not None and q_rank == 5 else (q_tensor.shape[0] if cum_seqlen_q is not None else s_q64)
+        s_k_total = k_tensor.shape[1] if cum_seqlen_k is not None and k_rank == 5 else (k_tensor.shape[0] if cum_seqlen_k is not None else s_k64)
         stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
         stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
@@ -741,23 +864,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # ((atom_v, rest_v), RestN, RestK)
                     tVgV = tVgV_dkl[None, None, None, mma_block_coord[2]]
 
-                    seqlen_kv_loop_start = FusedMask.get_trip_start(
-                        self.mask_type,
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        window_size_left,
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
+                        )
                     )
-                    seqlen_kv_loop_steps = FusedMask.get_trip_count(
-                        self.mask_type,
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        window_size_left,
-                        window_size_right,
-                    )
+                    seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
                     # Q
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
                         q_handle = load_q_producer.acquire_and_advance()
@@ -805,7 +924,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         v_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
-                            tVgV[None, iter, seqlen_kv_loop_steps - 1],
+                            tVgV[None, iter, seqlen_kv_loop_end - 1],
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
@@ -848,23 +967,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    seqlen_kv_loop_start = FusedMask.get_trip_start(
-                        self.mask_type,
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        window_size_left,
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
+                        )
                     )
-                    seqlen_kv_loop_steps = FusedMask.get_trip_count(
-                        self.mask_type,
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        window_size_left,
-                        window_size_right,
-                    )
+                    seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
 
                     cta_rank_in_cluster = cute.arch.make_warp_uniform(
                         cute.arch.block_idx_in_cluster()
@@ -1148,32 +1263,30 @@ class BlackwellFusedMultiHeadAttentionForward:
                     row_max_prev = -Float32.inf
                     row_sum = 0.0
 
-                    start_count = FusedMask.get_trip_start(
-                        self.mask_type,
+                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
                         mma_block_coord,
                         self.qk_mma_tiler,
                         seqlen_q,
                         seqlen_k,
-                        window_size_left,
-                    )
-                    trip_count = FusedMask.get_trip_count(
-                        self.mask_type,
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
+                        self.is_causal,
+                        self.is_local,
                         window_size_left,
                         window_size_right,
                     )
-                    unmask_count = FusedMask.get_unmasked_trip_count(
-                        self.mask_type,
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        window_size_left,
-                        window_size_right,
-                    )
+                    end_count = start_count + trip_count
+                    if cutlass.const_expr(self.use_semantic_trip_range):
+                        n_block_min_causal_local_mask, n_block_min_before_local_mask = (
+                            FusedMask.get_trip_mask_bounds_via_block_info(
+                                mma_block_coord,
+                                self.qk_mma_tiler,
+                                seqlen_q,
+                                seqlen_k,
+                                self.is_causal,
+                                self.is_local,
+                                window_size_left,
+                                window_size_right,
+                            )
+                        )
                     cS_base = cute.make_identity_tensor(
                         (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
                     )
@@ -1182,11 +1295,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     tScS = qk_thr_mma.partition_C(cS)
 
-                    for step in cutlass.range(start_count, trip_count, 1, unroll=1):
+                    for step in cutlass.range(start_count, end_count, 1, unroll=1):
                         cS_iter = cute.domain_offset(
                             (0, step * self.qk_mma_tiler[1]), cS
                         )
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
+                        if cutlass.const_expr(self.use_semantic_trip_range):
+                            need_apply_mask = (
+                                step >= n_block_min_causal_local_mask
+                                or step < n_block_min_before_local_mask
+                            )
+                        else:
+                            # Residual path only needs seqlen masking on the last K tile.
+                            need_apply_mask = step == end_count - 1
                         # Si -> Pi
                         (
                             row_max,
@@ -1195,7 +1316,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             p_mma_producer,
                             s_corr_producer,
                         ) = self.softmax_step(
-                            (step >= unmask_count, window_size_left, window_size_right),
+                            (need_apply_mask, window_size_left, window_size_right),
                             (
                                 row_max_prev,
                                 row_sum,
@@ -1278,12 +1399,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.select(self.pv_block_tiler, mode=[0, 1]),
                     )
 
-                    seqlen_kv_loop_steps = FusedMask.get_trip_count(
-                        self.mask_type,
+                    _, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
                         mma_block_coord,
                         self.qk_mma_tiler,
                         seqlen_q,
                         seqlen_k,
+                        self.is_causal,
+                        self.is_local,
                         window_size_left,
                         window_size_right,
                     )
@@ -1385,12 +1507,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
         if need_apply_mask:
-            FusedMask.apply_mask(
-                self.mask_type,
+            FusedMask.apply_mask_via_causal_local(
                 tTMEM_LOADrS,
                 tTMEM_LOADcS,
                 seqlen_q,
                 seqlen_k,
+                self.use_semantic_trip_range,
+                self.is_causal,
+                self.is_local,
                 window_size_left,
                 window_size_right,
             )

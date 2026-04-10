@@ -514,10 +514,6 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
-    # Convert to FusedMask kernel semantics for trip count calculation
-    fused_mask_window_size_left, fused_mask_window_size_right = _to_fused_mask_window(
-        causal, local, window_size_left, window_size_right
-    )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default()
@@ -608,9 +604,6 @@ def _flash_attn_fwd(
     # hd=256 2CTA forward uses dedicated kernel (SM100 only)
     use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
-
-    # For hd256 2CTA kernel, we need 5D tensors (will be set below if needed)
-    q_tensor_5d = k_tensor_5d = v_tensor_5d = o_tensor_5d = lse_tensor_5d = None
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -707,52 +700,6 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
     )
 
-    mask_type = MaskEnum.WINDOW_MASK_INFERENCE
-    if use_dedicated_hd256_kernel:
-        # Use FusedMask semantics for hd256 kernel
-        # fused_mask_window_size_left/right already has correct semantics:
-        # - causal: (None, 0)
-        # - local: (window_size_left, window_size_right)
-        # - bidirectional: (None, None)
-        # For causal attention, keep WINDOW_MASK_INFERENCE (handled via window_size_right=0)
-        if causal:
-            mask_type = MaskEnum.WINDOW_MASK_INFERENCE
-        elif cu_seqlens_k is not None:
-            seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-            mask_type = MaskEnum.RESIDUAL_MASK if (seqlens_k % tile_n != 0).any() else MaskEnum.WINDOW_MASK_INFERENCE
-        elif seqlen_k % tile_n != 0:
-            mask_type = MaskEnum.RESIDUAL_MASK
-
-        compile_key = (*compile_key, fused_mask_window_size_left, fused_mask_window_size_right, mask_type)
-
-    # For hd256 2CTA kernel, prepare 5D tensors and cu_seqlens tensors before compile check
-    if use_dedicated_hd256_kernel:
-        h_r = num_head // num_head_kv
-        if cu_seqlens_q is not None:
-            total_q = q.shape[0]
-            total_k = k.shape[0]
-            # Varlen: reshape to (1, total, num_head_kv, h_r, head_dim)
-            q_5d = q.view(1, total_q, num_head_kv, h_r, head_dim)
-            k_5d = k.view(1, total_k, num_head_kv, 1, head_dim)
-            v_5d = v.view(1, total_k, num_head_kv, 1, head_dim_v)
-            out_5d = out.view(1, total_q, num_head_kv, h_r, head_dim_v)
-            lse_5d = lse.view(1, num_head_kv, h_r, total_q)
-        else:
-            # Non-varlen: reshape to (batch, seqlen, num_head_kv, h_r, head_dim)
-            q_5d = q.view(batch_size, seqlen_q, num_head_kv, h_r, head_dim)
-            k_5d = k.view(batch_size, seqlen_k, num_head_kv, 1, head_dim)
-            v_5d = v.view(batch_size, seqlen_k, num_head_kv, 1, head_dim_v)
-            out_5d = out.view(batch_size, seqlen_q, num_head_kv, h_r, head_dim_v)
-            lse_5d = lse.view(batch_size, num_head_kv, h_r, seqlen_q)
-        # Create 5D cute tensors for hd256 kernel
-        q_tensor_5d, k_tensor_5d, v_tensor_5d, o_tensor_5d = [
-            to_cute_tensor(t) for t in (q_5d, k_5d, v_5d, out_5d)
-        ]
-        lse_tensor_5d = to_cute_tensor(lse_5d, assumed_align=4)
-        # Create cu_seqlens cute tensors (needed for kernel call, same as in compile block)
-        cu_seqlens_q_tensor = to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0) if cu_seqlens_q is not None else None
-        cu_seqlens_k_tensor = to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0) if cu_seqlens_k is not None else None
-
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -835,59 +782,36 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, tile_n],
             )
         elif arch // 10 in [10, 11]:
-            if use_dedicated_hd256_kernel:
-                # hd=256 2CTA forward: check for currently unsupported features
-                assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
-                assert score_mod is None, "SM100 forward with head_dim=256 does not support score_mod"
-                assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
-                assert block_sparse_tensors is None, "SM100 forward with head_dim=256 does not support block sparsity"
-                assert page_table is None, "SM100 forward with head_dim=256 does not support paged KV"
-                assert learnable_sink is None, "SM100 forward with head_dim=256 does not support learnable_sink"
-                assert seqused_q is None and seqused_k is None, "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
-                assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
-
-                # Determine mask type for hd=256 2CTA forward
-                qk_acc_dtype = torch2cute_dtype_map[torch.float32]
-                pv_acc_dtype = torch2cute_dtype_map[torch.float32]
-                mma_tiler = (128, 128, head_dim)
-                # Force is_persistent=False and use_clc_scheduler=False
-                is_persistent = False
-                use_clc_scheduler_forced = False
-
-                fa_fwd = BlackwellFusedMultiHeadAttentionForward(
-                    qk_acc_dtype,
-                    pv_acc_dtype,
-                    mma_tiler,
-                    is_persistent,
-                    mask_type,
-                    use_clc_scheduler=use_clc_scheduler_forced,
-                )
-            else:
-                fa_fwd = FlashAttentionForwardSm100(
-                    head_dim,
-                    head_dim_v,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    is_causal=causal,
-                    is_local=local,
-                    is_split_kv=is_split_kv,
-                    pack_gqa=pack_gqa,
-                    m_block_size=tile_m,
-                    n_block_size=tile_n,
-                    q_stage=q_stage,
-                    is_persistent=not causal
-                        and not local
-                        and cu_seqlens_q is None
-                        and seqused_q is None
-                        and not is_split_kv,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
-                    is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    use_2cta_instrs=use_2cta_instrs,
-                    use_clc_scheduler=requested_use_clc_scheduler,
-                )
+            flash_fwd_obj_cls = (
+                BlackwellFusedMultiHeadAttentionForward
+                if use_dedicated_hd256_kernel
+                else FlashAttentionForwardSm100
+            )
+            fa_fwd = flash_fwd_obj_cls(
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                is_split_kv=is_split_kv,
+                pack_gqa=pack_gqa,
+                m_block_size=tile_m,
+                n_block_size=tile_n,
+                q_stage=q_stage,
+                is_persistent=not causal
+                    and not local
+                    and cu_seqlens_q is None
+                    and seqused_q is None
+                    and not is_split_kv,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+                paged_kv_non_tma=page_size not in [None, tile_n],
+                is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                q_subtile_factor=q_subtile_factor,
+                use_2cta_instrs=use_2cta_instrs,
+                use_clc_scheduler=requested_use_clc_scheduler,
+            )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
@@ -915,107 +839,51 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        if use_dedicated_hd256_kernel:
-            # hd=256 2CTA forward has different __call__ signature
-            problem_size = (Int32(batch_size), Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(num_head), Int32(num_head_kv), Int32(head_dim))
-            log2_e = math.log2(math.exp(1.0))
-            scale_softmax_log2 = softmax_scale * log2_e
-            scale_output = 1.0
-
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                fa_fwd,
-                q_tensor_5d,
-                k_tensor_5d,
-                v_tensor_5d,
-                o_tensor_5d,
-                problem_size,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                lse_tensor_5d,
-                scale_softmax_log2,
-                softmax_scale,
-                scale_output,
-                fused_mask_window_size_left if fused_mask_window_size_left is None else Int32(fused_mask_window_size_left),
-                fused_mask_window_size_right if fused_mask_window_size_right is None else Int32(fused_mask_window_size_right),
-                current_stream,
-                options="--enable-tvm-ffi",
-            )
-        else:
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                fa_fwd,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                page_table_tensor,
-                window_size_left,
-                window_size_right,
-                learnable_sink_tensor,
-                sparse_tensors,
-                cute_aux_tensors,
-                current_stream,
-                options="--enable-tvm-ffi",
-            )
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            fa_fwd,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
+            page_table_tensor,
+            window_size_left,
+            window_size_right,
+            learnable_sink_tensor,
+            sparse_tensors,
+            cute_aux_tensors,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
     # - Use those fake metadata to populate compilation cache
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        if use_dedicated_hd256_kernel:
-            # hd=256 2CTA forward has different __call__ signature
-            problem_size = (Int32(batch_size), Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(num_head), Int32(num_head_kv), Int32(head_dim))
-            log2_e = math.log2(math.exp(1.0))
-            scale_softmax_log2 = softmax_scale * log2_e
-            scale_output = 1.0
-
-            _flash_attn_fwd.compile_cache[compile_key](
-                q_tensor_5d,
-                k_tensor_5d,
-                v_tensor_5d,
-                o_tensor_5d,
-                problem_size,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                lse_tensor_5d,
-                scale_softmax_log2,
-                softmax_scale,
-                scale_output,
-                fused_mask_window_size_left if fused_mask_window_size_left is None else Int32(fused_mask_window_size_left),
-                fused_mask_window_size_right if fused_mask_window_size_right is None else Int32(fused_mask_window_size_right),
-            )
-            # Reshape outputs back to 3D for hd256 2CTA kernel
-            if cu_seqlens_q is not None:
-                out = out.view(total_q, num_head, head_dim_v)
-                lse = lse.view(num_head, total_q)
-            else:
-                out = out.view(batch_size, seqlen_q, num_head, head_dim_v)
-                lse = lse.view(batch_size, num_head, seqlen_q)
-        else:
-            _flash_attn_fwd.compile_cache[compile_key](
-                q.detach(),
-                k.detach(),
-                v.detach(),
-                out.detach() if not is_split_kv else out_partial,
-                lse_partial if is_split_kv else lse,
-                softmax_scale,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                page_table,
-                window_size_left,
-                window_size_right,
-                learnable_sink,
-                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-                aux_tensors,
-            )
+        _flash_attn_fwd.compile_cache[compile_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            out.detach() if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+            aux_tensors,
+        )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
