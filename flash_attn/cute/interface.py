@@ -330,25 +330,25 @@ def _reshape_tensors_for_2cta_bwd(
     - LSE: (b, h_k, h_r, s) for non-varlen, (1, h_k, h_r, total_q) for varlen
     """
     if varlen:
-        q_5d = q.view(1, total_q, num_head_kv, qhead_per_kvhead, head_dim)
-        k_5d = k.view(1, total_k, num_head_kv, 1, head_dim)
-        v_5d = v.view(1, total_k, num_head_kv, 1, head_dim_v)
-        out_5d = out.view(1, total_q, num_head_kv, qhead_per_kvhead, head_dim_v)
-        dq_5d = dq.view(1, total_q, num_head_kv, qhead_per_kvhead, head_dim)
-        dk_5d = dk.view(1, total_k, num_head_kv, 1, head_dim)
-        dv_5d = dv.view(1, total_k, num_head_kv, 1, head_dim_v)
-        dout_5d = dout.view(1, total_q, num_head_kv, qhead_per_kvhead, head_dim_v)
-        lse_5d = lse.view(1, num_head_kv, qhead_per_kvhead, total_q)
+        q_5d = q.reshape(1, total_q, num_head_kv, qhead_per_kvhead, head_dim)
+        k_5d = k.reshape(1, total_k, num_head_kv, 1, head_dim)
+        v_5d = v.reshape(1, total_k, num_head_kv, 1, head_dim_v)
+        out_5d = out.reshape(1, total_q, num_head_kv, qhead_per_kvhead, head_dim_v)
+        dq_5d = dq.reshape(1, total_q, num_head_kv, qhead_per_kvhead, head_dim)
+        dk_5d = dk.reshape(1, total_k, num_head_kv, 1, head_dim)
+        dv_5d = dv.reshape(1, total_k, num_head_kv, 1, head_dim_v)
+        dout_5d = dout.reshape(1, total_q, num_head_kv, qhead_per_kvhead, head_dim_v)
+        lse_5d = lse.reshape(1, num_head_kv, qhead_per_kvhead, total_q)
     else:
-        q_5d = q.view(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim)
-        k_5d = k.view(batch_size, seqlen_k, num_head_kv, 1, head_dim)
-        v_5d = v.view(batch_size, seqlen_k, num_head_kv, 1, head_dim_v)
-        out_5d = out.view(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim_v)
-        dq_5d = dq.view(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim)
-        dk_5d = dk.view(batch_size, seqlen_k, num_head_kv, 1, head_dim)
-        dv_5d = dv.view(batch_size, seqlen_k, num_head_kv, 1, head_dim_v)
-        dout_5d = dout.view(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim_v)
-        lse_5d = lse.view(batch_size, num_head_kv, qhead_per_kvhead, seqlen_q)
+        q_5d = q.reshape(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim)
+        k_5d = k.reshape(batch_size, seqlen_k, num_head_kv, 1, head_dim)
+        v_5d = v.reshape(batch_size, seqlen_k, num_head_kv, 1, head_dim_v)
+        out_5d = out.reshape(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim_v)
+        dq_5d = dq.reshape(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim)
+        dk_5d = dk.reshape(batch_size, seqlen_k, num_head_kv, 1, head_dim)
+        dv_5d = dv.reshape(batch_size, seqlen_k, num_head_kv, 1, head_dim_v)
+        dout_5d = dout.reshape(batch_size, seqlen_q, num_head_kv, qhead_per_kvhead, head_dim_v)
+        lse_5d = lse.reshape(batch_size, num_head_kv, qhead_per_kvhead, seqlen_q)
     return q_5d, k_5d, v_5d, out_5d, dout_5d, dq_5d, dk_5d, dv_5d, lse_5d
 
 
@@ -782,6 +782,17 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, tile_n],
             )
         elif arch // 10 in [10, 11]:
+            if use_dedicated_hd256_kernel:
+                # hd=256 2CTA forward: check for currently unsupported features
+                assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
+                assert not use_block_sparsity, \
+                    "SM100 forward with head_dim=256 does not support block sparsity"
+                assert learnable_sink is None, \
+                    "SM100 forward with head_dim=256 does not support learnable_sink"
+                assert seqused_q is None and seqused_k is None, \
+                    "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
+                # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
+                pack_gqa = False
             flash_fwd_obj_cls = (
                 BlackwellFusedMultiHeadAttentionForward
                 if use_dedicated_hd256_kernel
@@ -1279,18 +1290,32 @@ def _flash_attn_bwd(
     dq_tile_mn = (128, 128)
     dkdv_tile_mn = (128, 64)
     if use_dedicated_hd256_kernel:
+        if varlen:
+            assert cu_seqlens_q is not None and cu_seqlens_k is not None, \
+                "SM100 backward with head_dim=256 requires both cu_seqlens_q and cu_seqlens_k"
         # Determine mask type for hd=256 2CTA backward
         if max_seqlen_q is None:
-            max_seqlen_q = (
-                q.shape[-3] if cu_seqlens_q is None else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
-            )
+            if cu_seqlens_q is None:
+                max_seqlen_q = q.shape[-3]
+            elif is_fake_mode():
+                max_seqlen_q = total_q
+            else:
+                max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
 
         if max_seqlen_k is None:
-            max_seqlen_k = (
-                k.shape[-3] if cu_seqlens_k is None else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
-            )
+            if cu_seqlens_k is None:
+                max_seqlen_k = k.shape[-3]
+            elif is_fake_mode():
+                max_seqlen_k = total_k
+            else:
+                max_seqlen_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+
         if causal:
             mask_type = MaskEnum.WINDOW_MASK_INFERENCE
+        elif is_fake_mode():
+            # In FakeTensorMode, .any() triggers data-dependent scalar extraction.
+            # Use RESIDUAL_MASK (the conservative/general option) to compile both paths.
+            mask_type = MaskEnum.RESIDUAL_MASK
         elif cu_seqlens_k is not None:
             seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             mask_type = MaskEnum.RESIDUAL_MASK if (seqlens_k % dq_tile_mn[1] != 0).any() else MaskEnum.WINDOW_MASK_INFERENCE

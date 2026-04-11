@@ -819,8 +819,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+        for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
+            if warp_idx == self.empty_warp_id[_i]:
+                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
         if cutlass.const_expr(self.use_clc_scheduler):
             tile_sched = FmhaClcDynamicTileScheduler.create(
@@ -1223,6 +1224,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                         )
                                         qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 k_handle.release()
+                            cute.arch.fence_view_async_tmem_store()
                             s_handle.commit()
 
                             # dOV0
@@ -1264,6 +1266,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                         )
                                         dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 v_handle.release()
+                            cute.arch.fence_view_async_tmem_store()
                             dp_handle.commit()
 
                             for i in cutlass.range(
@@ -2128,7 +2131,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
                 tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
                 tTMrdQ = cute.make_rmem_tensor(
-                    tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype
+                    tTMEM_LOADcdQ[None, i, 0].shape, self.acc_dtype
                 )
                 cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
                 tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)

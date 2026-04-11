@@ -62,6 +62,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
         assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
         assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
+        assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
         assert q_subtile_factor is None, "SM100 forward with head_dim=256 does not support q_subtile_factor"
         assert m_block_size == 128 and n_block_size == 128, (
@@ -742,8 +743,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+        for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
+            if warp_idx == self.empty_warp_id[_i]:
+                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
         if cutlass.const_expr(self.use_clc_scheduler):
             tile_sched = FmhaClcDynamicTileScheduler.create(
@@ -1773,7 +1775,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
                 tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
                 tTMrO = cute.make_rmem_tensor(
-                    tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype
+                    tTMEM_LOADcO[None, i, 0].shape, self.pv_acc_dtype
                 )
                 cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
                 for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
