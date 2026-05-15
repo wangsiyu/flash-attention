@@ -6,8 +6,8 @@
 # - MHA, GQA, MQA
 # - hdim 256
 # - varlen
-# Unsupported features that will be added later:
 # - sliding window
+# Unsupported features that will be added later:
 # - score_mod / mask_mod
 # - paged KV
 # - split-kv
@@ -90,7 +90,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
-        assert not is_local, "SM100 forward with head_dim=256 does not support local attention yet"
         assert not use_clc_scheduler, "SM100 forward with head_dim=256 does not support CLC scheduler"
         assert q_subtile_factor is None, (
             "SM100 forward with head_dim=256 does not support q_subtile_factor"
@@ -229,12 +228,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
         assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
-        assert not self.is_local, (
-            "SM100 forward with head_dim=256 does not support local attention yet"
-        )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 forward with head_dim=256 does not support runtime window_size overrides"
-        )
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
