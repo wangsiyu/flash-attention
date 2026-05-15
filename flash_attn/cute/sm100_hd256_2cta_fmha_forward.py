@@ -136,7 +136,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
-        self.use_semantic_trip_range = is_causal or is_local
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
@@ -148,7 +147,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         self.use_clc_scheduler = False
         self.scheduling_mode = SchedulingMode.STATIC
-        self.scheduler_m_block_is_logical = not is_varlen_q
         self.use_tma_Q = True
 
         if is_varlen_q:
@@ -900,31 +898,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         return
 
     @cute.jit
-    def normalize_work_tile(self, work_tile, mma_tile_coord_v: Int32):
-        scheduler_m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-        m_block = scheduler_m_block
-        if const_expr(not self.scheduler_m_block_is_logical):
-            m_block = scheduler_m_block // self.cta_group_size
-        m_tile_idx = self.get_m_tile_idx(m_block, mma_tile_coord_v)
-        head_idx_kv = self._kv_head_idx(head_idx)
-        return m_block, m_tile_idx, head_idx, head_idx_kv, batch_idx, split_idx
-
-    @cute.jit
-    def get_m_tile_idx(self, m_block: Int32, mma_tile_coord_v: Int32) -> Int32:
-        return m_block * self.cta_group_size + mma_tile_coord_v
-
-    @cute.jit
-    def get_mask_m_block(self, m_block: Int32) -> Int32:
-        return m_block * self.cta_group_size
-
-    @cute.jit
-    def get_sparse_m_block(self, m_block: Int32) -> Int32:
-        # Sparse metadata is indexed by the logical 256-row Q tile in this hd256 2CTA kernel.
-        return m_block
-
-    @cute.jit
     def _kv_head_idx(self, head_idx: Int32) -> Int32:
-        if const_expr(self.pack_gqa):
+        if cutlass.const_expr(self.pack_gqa):
             return head_idx
         return head_idx // self.qhead_per_kvhead
 
@@ -1017,139 +992,138 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, _, head_idx, head_idx_kv, batch_idx, _ = self.normalize_work_tile(
-                work_tile, mma_tile_coord_v
-            )
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.is_varlen_q):
+                m_block = m_block // self.cta_group_size
+            head_idx_kv = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
-            process_tile = m_block * self.mma_tiler_qk[0] < seqlen.seqlen_q
-            if process_tile:
-                mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
-                else:
-                    mK_cur = cute.domain_offset(
-                        (seqlen.offset_k, Int32(0)), mK[None, None, head_idx_kv]
-                    )
-                    mV_cur = cute.domain_offset(
-                        (Int32(0), seqlen.offset_k), mV[None, None, head_idx_kv]
-                    )
-                gK = cute.local_tile(
-                    mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, None)
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            if const_expr(not seqlen.has_cu_seqlens_k):
+                mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+            else:
+                mK_cur = cute.domain_offset(
+                    (seqlen.offset_k, Int32(0)), mK[None, None, head_idx_kv]
                 )
-                gV = cute.local_tile(
-                    mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (None, None)
+                mV_cur = cute.domain_offset(
+                    (Int32(0), seqlen.offset_k), mV[None, None, head_idx_kv]
                 )
-                tSgK = thr_mma_qk.partition_B(gK)
-                tOgV = thr_mma_pv.partition_B(gV)
+            gK = cute.local_tile(
+                mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, None)
+            )
+            gV = cute.local_tile(
+                mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (None, None)
+            )
+            tSgK = thr_mma_qk.partition_B(gK)
+            tOgV = thr_mma_pv.partition_B(gV)
 
-                q_cta_layout = cute.make_layout(
-                    cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape
-                )
-                # (bM, bK, loopM, loopK, loopL)
-                gQ = cute.local_tile(
-                    mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (m_block, None)
-                )
-                tSgQ = thr_mma_qk.partition_A(gQ)
-                load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Q,
-                    block_in_cluster_coord_vmnk[2],
-                    q_cta_layout,
-                    tSgQ,
-                    sQ,
-                )
-                kv_cta_layout = cute.make_layout(
-                    cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape
-                )
-                tKsK, tKgK = cpasync.tma_partition(
-                    tma_atom_K,
-                    block_in_cluster_coord_vmnk[1],
-                    kv_cta_layout,
-                    cute.group_modes(sK, 0, 3),
-                    cute.group_modes(tSgK, 0, 3),
-                )
-                tVsV, tVgV = cpasync.tma_partition(
-                    tma_atom_V,
-                    block_in_cluster_coord_vmnk[1],
-                    kv_cta_layout,
-                    cute.group_modes(sV, 0, 3),
-                    cute.group_modes(tOgV, 0, 3),
-                )
-                # ((atom_v, rest_v), RestN, RestK)
-                tKgK = tKgK[None, None, None]
-                # ((atom_v, rest_v), RestN, RestK)
-                tVgV = tVgV[None, None, None]
-                load_Q = partial(
-                    self.load_Q,
-                    load_Q_fn,
-                    pipeline_q=pipeline_q,
-                    phase=q_producer_phase,
-                )
-                load_K = partial(
-                    self.load_KV,
-                    tma_atom_K,
-                    tKgK,
-                    tKsK,
-                    K_or_V="K",
-                    pipeline_kv=pipeline_kv,
-                )
-                load_V = partial(
-                    self.load_KV,
-                    tma_atom_V,
-                    tVgV,
-                    tVsV,
-                    K_or_V="V",
-                    pipeline_kv=pipeline_kv,
-                )
+            q_cta_layout = cute.make_layout(
+                cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape
+            )
+            # (bM, bK, loopM, loopK, loopL)
+            gQ = cute.local_tile(
+                mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (m_block, None)
+            )
+            tSgQ = thr_mma_qk.partition_A(gQ)
+            load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q,
+                block_in_cluster_coord_vmnk[2],
+                q_cta_layout,
+                tSgQ,
+                sQ,
+            )
+            kv_cta_layout = cute.make_layout(
+                cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape
+            )
+            tKsK, tKgK = cpasync.tma_partition(
+                tma_atom_K,
+                block_in_cluster_coord_vmnk[1],
+                kv_cta_layout,
+                cute.group_modes(sK, 0, 3),
+                cute.group_modes(tSgK, 0, 3),
+            )
+            tVsV, tVgV = cpasync.tma_partition(
+                tma_atom_V,
+                block_in_cluster_coord_vmnk[1],
+                kv_cta_layout,
+                cute.group_modes(sV, 0, 3),
+                cute.group_modes(tOgV, 0, 3),
+            )
+            # ((atom_v, rest_v), RestN, RestK)
+            tKgK = tKgK[None, None, None]
+            # ((atom_v, rest_v), RestN, RestK)
+            tVgV = tVgV[None, None, None]
+            load_Q = partial(
+                self.load_Q,
+                load_Q_fn,
+                pipeline_q=pipeline_q,
+                phase=q_producer_phase,
+            )
+            load_K = partial(
+                self.load_KV,
+                tma_atom_K,
+                tKgK,
+                tKsK,
+                K_or_V="K",
+                pipeline_kv=pipeline_kv,
+            )
+            load_V = partial(
+                self.load_KV,
+                tma_atom_V,
+                tVgV,
+                tVsV,
+                K_or_V="V",
+                pipeline_kv=pipeline_kv,
+            )
 
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, Int32(0), num_splits
-                )
-                if n_block_min < n_block_max:
-                    # Q tile, split across the head-dim stages.
-                    if issue_q_for_this_warp:
-                        for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
-                            load_Q(block=iter, stage=iter)
-                    q_producer_phase ^= 1
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, num_splits
+            )
+            if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+                # Q tile, split across the head-dim stages.
+                if issue_q_for_this_warp:
+                    for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
+                        load_Q(block=iter, stage=iter)
+                q_producer_phase ^= 1
 
-                    # First logical KV block: n_block_max - 1.
-                    kv_coord = n_block_max - 1
+                # First logical KV block: n_block_max - 1.
+                kv_coord = n_block_max - 1
+                if issue_kv_for_this_warp:
+                    for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
+                        load_K(
+                            block=kv_coord,
+                            hdim_stage=iter,
+                            producer_state=kv_producer_state,
+                        )
+                        kv_producer_state.advance()
+
+                for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                    n_block = n_block_max - 2 - i
+                    # QK-ahead issue order: load next K before the previous V.
                     if issue_kv_for_this_warp:
                         for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
                             load_K(
-                                block=kv_coord,
+                                block=n_block,
                                 hdim_stage=iter,
                                 producer_state=kv_producer_state,
                             )
                             kv_producer_state.advance()
-
-                    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                        n_block = n_block_max - 2 - i
-                        # QK-ahead issue order: load next K before the previous V.
-                        if issue_kv_for_this_warp:
-                            for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
-                                load_K(
-                                    block=n_block,
-                                    hdim_stage=iter,
-                                    producer_state=kv_producer_state,
-                                )
-                                kv_producer_state.advance()
-                            # V for the previously produced score tile.
-                            for iter in cutlass.range(self.pv_hdim_stage, unroll=1):
-                                load_V(
-                                    block=n_block + 1,
-                                    hdim_stage=iter,
-                                    producer_state=kv_producer_state,
-                                )
-                                kv_producer_state.advance()
-                    # Final V tile for n_block_min.
-                    if issue_kv_for_this_warp:
+                        # V for the previously produced score tile.
                         for iter in cutlass.range(self.pv_hdim_stage, unroll=1):
                             load_V(
-                                block=n_block_min,
+                                block=n_block + 1,
                                 hdim_stage=iter,
                                 producer_state=kv_producer_state,
                             )
                             kv_producer_state.advance()
+                # Final V tile for n_block_min.
+                if issue_kv_for_this_warp:
+                    for iter in cutlass.range(self.pv_hdim_stage, unroll=1):
+                        load_V(
+                            block=n_block_min,
+                            hdim_stage=iter,
+                            producer_state=kv_producer_state,
+                        )
+                        kv_producer_state.advance()
 
             work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
@@ -1258,20 +1232,22 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, _, _, _, batch_idx, _ = self.normalize_work_tile(
-                work_tile, mma_tile_coord_v
-            )
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.is_varlen_q):
+                m_block = m_block // self.cta_group_size
             seqlen = SeqlenInfoCls(batch_idx)
-            process_tile = m_block * self.mma_tiler_qk[0] < seqlen.seqlen_q
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, num_splits
+            )
+            block_iter_count = n_block_max - n_block_min
+            if const_expr(not self.is_split_kv):
+                process_tile = True
+            else:
+                process_tile = n_block_min < n_block_max
 
             if process_tile:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, Int32(0), num_splits
-                )
-                tile_block_count = n_block_max - n_block_min
-
                 O_should_accumulate = False
-                if tile_block_count > 1:
+                if block_iter_count > 1:
                     # First QK for logical n_block_max - 1.
                     if is_leader_cta:
                         pipeline_s_p_o.producer_acquire(s_p_o_producer_state)
@@ -1295,7 +1271,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             mma_kv_consumer_state.advance()
                         pipeline_s_p_o.producer_commit(s_p_o_producer_state)
                         s_p_o_producer_state.advance()
-                    for i in cutlass.range(1, tile_block_count - 1, 1, unroll=1):
+                    for i in cutlass.range(1, block_iter_count - 1, 1, unroll=1):
                         # Next QK in reverse logical n_block order.
                         if is_leader_cta:
                             pipeline_s_p_o.producer_acquire(s_p_o_producer_state)
@@ -1482,14 +1458,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            if const_expr(not self.scheduler_m_block_is_logical):
+            if const_expr(self.is_varlen_q):
                 m_block = m_block // self.cta_group_size
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             mask = AttentionMaskCls(seqlen)
             shared_mask_kwargs = dict(
-                m_block=self.get_mask_m_block(m_block),
+                m_block=m_block * self.cta_group_size,
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
@@ -1535,7 +1511,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 sScale=sScale,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                m_block=self.get_mask_m_block(m_block),
+                m_block=m_block * self.cta_group_size,
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
@@ -1651,13 +1627,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            if const_expr(not self.scheduler_m_block_is_logical):
+            if const_expr(self.is_varlen_q):
                 m_block = m_block // self.cta_group_size
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
             )
-            m_tile_idx = self.get_m_tile_idx(m_block, mma_tile_coord_v)
+            m_tile_idx = m_block * self.cta_group_size + mma_tile_coord_v
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
 
             # (bM, bN, loopM, loopN, loopL)
@@ -1678,10 +1654,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
 
             total_block_count = n_block_max - n_block_min
-            has_work = (
-                m_block * self.mma_tiler_qk[0] < seqlen.seqlen_q
-                and total_block_count > Int32(0)
-            )
+            has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
             if has_work:
                 # The first accumulated O tile has no previous scale correction.
