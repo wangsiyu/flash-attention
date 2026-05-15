@@ -773,8 +773,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        varlen = mCuSeqlensQ is not None or mCuSeqlensK is not None
-
         # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
             with cute.arch.elect_one():
@@ -1173,7 +1171,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 SeqlenInfoCls,
                 AttentionMaskCls,
                 TileSchedulerCls,
-                varlen,
                 tdVrP,
                 sP,
                 sK,
@@ -1881,7 +1878,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         SeqlenInfoCls,
         AttentionMaskCls,
         TileSchedulerCls,
-        varlen: bool,
         tdVrP: cute.Tensor,
         sP: cute.Tensor,
         sK: cute.Tensor,
@@ -2001,14 +1997,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            blk_coord_k, head_idx_kv, batch_idx, _ = work_tile.tile_idx
+            n_block, head_idx_kv, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             seqlen_q_cur_batch = seqlen.seqlen_q
             m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, blk_coord_k // self.cluster_shape_mn[0]
+                seqlen, n_block // self.cluster_shape_mn[0]
             )
             mask = AttentionMaskCls(seqlen)
-            n_block_for_cluster = blk_coord_k // self.cluster_shape_mn[0]
+            n_block_for_cluster = n_block // self.cluster_shape_mn[0]
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
@@ -2120,7 +2116,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             consumer_state_dPsum.index,
                         ],
                     )
-                    if cutlass.const_expr(varlen):
+                    if cutlass.const_expr(self.is_varlen_q):
                         if not cute.elem_less(
                             cute.get(tdPcdP_t2r[v], mode=[1]), seqlen_q_cur_batch
                         ):
@@ -2167,7 +2163,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     tidx,
                     batch_idx,
                     head_idx_kv,
-                    blk_coord_k,
+                    n_block,
                     seqlen,
                     thr_mma_dV,
                     thr_mma_dK,
@@ -2188,6 +2184,61 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     barrier_id=self.epilogue_sync_bar_id,
                     number_of_threads=self.num_compute_warps * self.threads_per_warp,
                 )
+
+            # Zero dK/dV for empty tiles (local attention).
+            if const_expr(not self.dKV_postprocess):
+                should_zero_dKV = False
+                if const_expr(self.is_local or self.is_varlen_q):
+                    should_zero_dKV = m_block_min >= m_block_max
+
+                if should_zero_dKV:
+                    cluster_tile_n = self.tile_n * self.cta_group_size
+                    n_block_for_tile = n_block // self.cta_group_size
+                    gmem_tiled_copy_zero_dK = copy_utils.tiled_copy_2d(
+                        self.dk_dtype,
+                        math.gcd(64, self.tile_hdim),
+                        128,
+                    )
+                    gmem_tiled_copy_zero_dV = copy_utils.tiled_copy_2d(
+                        self.dv_dtype,
+                        math.gcd(64, self.tile_hdimv),
+                        128,
+                    )
+                    gmem_thr_copy_zero_dK = gmem_tiled_copy_zero_dK.get_slice(dp_idx)
+                    gmem_thr_copy_zero_dV = gmem_tiled_copy_zero_dV.get_slice(dp_idx)
+                    mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[
+                        None, None, head_idx_kv
+                    ]
+                    mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[
+                        None, None, head_idx_kv
+                    ]
+                    gdK = cute.local_tile(
+                        mdK_cur, (cluster_tile_n, self.tile_hdim), (n_block_for_tile, 0)
+                    )
+                    gdV = cute.local_tile(
+                        mdV_cur, (cluster_tile_n, self.tile_hdimv), (n_block_for_tile, 0)
+                    )
+                    tdKgdK = gmem_thr_copy_zero_dK.partition_D(gdK)
+                    tdVgdV = gmem_thr_copy_zero_dV.partition_D(gdV)
+                    cdK = cute.make_identity_tensor((cluster_tile_n, self.tile_hdim))
+                    cdV = cute.make_identity_tensor((cluster_tile_n, self.tile_hdimv))
+                    tdKcdK = gmem_thr_copy_zero_dK.partition_D(cdK)
+                    tdVcdV = gmem_thr_copy_zero_dV.partition_D(cdV)
+                    assert cute.size(tdKgdK[None, 0, 0]) == cute.size(tdVgdV[None, 0, 0])
+                    zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
+                    zero.fill(0.0)
+                    if tidx < 128:
+                        for i in cutlass.range_constexpr(tdKgdK.shape[1]):
+                            row_idx = tdKcdK[0, i, 0][0]
+                            if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
+                                for j in cutlass.range_constexpr(tdKgdK.shape[2]):
+                                    cute.copy(gmem_tiled_copy_zero_dK, zero, tdKgdK[None, i, j])
+                    else:
+                        for i in cutlass.range_constexpr(tdVgdV.shape[1]):
+                            row_idx = tdVcdV[0, i, 0][0]
+                            if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
+                                for j in cutlass.range_constexpr(tdVgdV.shape[2]):
+                                    cute.copy(gmem_tiled_copy_zero_dV, zero, tdVgdV[None, i, j])
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()

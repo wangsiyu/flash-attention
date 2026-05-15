@@ -128,7 +128,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert head_dim == 256 and head_dim_v == 256, (
             "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
         )
-        assert not is_local, "SM100 backward with head_dim=256 does not support local attention"
         assert tile_m_dq == 128 and tile_n_dq == 128, (
             "SM100 dedicated backward kernel only supports tile_m_dq=128 and tile_n_dq=128"
         )
@@ -220,8 +219,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
         cumulative_s_k: cute.Tensor | None,
         seqused_q: cute.Tensor | None = None,
         seqused_k: cute.Tensor | None = None,
-        window_size_left: Int32 | None = None,
-        window_size_right: Int32 | None = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
