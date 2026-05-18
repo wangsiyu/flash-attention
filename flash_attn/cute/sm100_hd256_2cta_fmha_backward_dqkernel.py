@@ -1954,6 +1954,37 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         pipeline_dQ,
                         consumer_state_dQ,
                     )
+            # Zero dQ for empty tiles (local attention or zero-length K).
+            if const_expr(self.is_local or self.is_varlen_k):
+                should_zero_dQ = n_block_min >= n_block_max
+
+                if should_zero_dQ:
+                    gmem_tiled_copy_zero_dQ = copy_utils.tiled_copy_2d(
+                        self.dq_dtype,
+                        math.gcd(64, self.tile_hdim),
+                        128,
+                    )
+                    gmem_thr_copy_zero_dQ = gmem_tiled_copy_zero_dQ.get_slice(tidx)
+                    mdQ_cur = seqlen.offset_batch_Q(mdQ, batch_idx, dim=3)[
+                        None, None, head_idx
+                    ]
+                    gdQ = cute.local_tile(
+                        mdQ_cur, cute.select(self.dsk_block_tiler, mode=[0, 1]), (m_block, 0)
+                    )
+                    tdQgdQ = gmem_thr_copy_zero_dQ.partition_D(gdQ)
+                    cdQ = cute.local_tile(
+                        cute.make_identity_tensor(mdQ_cur.shape),
+                        cute.select(self.dsk_block_tiler, mode=[0, 1]),
+                        (m_block, 0),
+                    )
+                    tdQcdQ = gmem_thr_copy_zero_dQ.partition_D(cdQ)
+                    zero = cute.make_fragment_like(tdQgdQ[None, 0, 0])
+                    zero.fill(0.0)
+                    for i in cutlass.range_constexpr(tdQgdQ.shape[1]):
+                        row_idx = tdQcdQ[0, i, 0][0]
+                        if row_idx < seqlen.seqlen_q:
+                            for j in cutlass.range_constexpr(tdQgdQ.shape[2]):
+                                cute.copy(gmem_tiled_copy_zero_dQ, zero, tdQgdQ[None, i, j])
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
         pipeline_dS.producer_tail(producer_state_dS)

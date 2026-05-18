@@ -545,8 +545,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if zero_lengths_q or zero_lengths_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support zero-length sequences yet")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
