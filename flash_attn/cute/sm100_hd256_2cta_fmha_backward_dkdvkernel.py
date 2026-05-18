@@ -361,6 +361,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -376,8 +378,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.dv_dtype = mdV.element_type
         self.ds_dtype = self.q_dtype
 
-        self.is_varlen_k = mCuSeqlensK is not None
-        self.is_varlen_q = mCuSeqlensQ is not None
+        self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
+        self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
         self.use_tma_store = True
         self.dKV_postprocess = False
 
@@ -563,7 +565,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tile_shape_mn=self.cta_tiler[:2],  # (tile_n, tile_m)
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=mCuSeqlensK,
-            mSeqUsedQ=None,
+            mSeqUsedQ=mSeqUsedK,
             qhead_per_kvhead_packgqa=1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
@@ -682,6 +684,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tma_tensor_dK,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
             tma_atom_Q,
             tma_atom_Qt,
             tma_atom_K,
@@ -737,6 +741,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         mdK_tma_tensor: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_Qt: Optional[cute.CopyAtom],
         tma_atom_K: cute.CopyAtom,
@@ -1015,8 +1021,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
             tile_m=self.tile_m,
             tile_n=self.tile_n * self.cluster_shape_mn[0],
         )

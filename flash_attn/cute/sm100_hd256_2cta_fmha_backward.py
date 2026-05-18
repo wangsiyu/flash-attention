@@ -229,9 +229,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
-        assert seqused_q is None and seqused_k is None, (
-            "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-        )
         assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
             "SM100 backward with head_dim=256 does not use semaphores"
         )
@@ -293,6 +290,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             scale_softmax,
             mCuSeqlensQ=cumulative_s_q,
             mCuSeqlensK=cumulative_s_k,
+            mSeqUsedQ=seqused_q,
+            mSeqUsedK=seqused_k,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             mdQ_semaphore=dQ_semaphore,
@@ -312,6 +311,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             scale_softmax,
             mCuSeqlensQ=cumulative_s_q,
             mCuSeqlensK=cumulative_s_k,
+            mSeqUsedQ=seqused_q,
+            mSeqUsedK=seqused_k,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             stream=stream,

@@ -217,9 +217,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         aux_tensors: Optional[list] = None,
         stream: cuda.CUstream = None,
     ):
-        assert mSeqUsedQ is None and mSeqUsedK is None, (
-            "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
-        )
         assert mPageTable is None, "SM100 forward with head_dim=256 does not support paged KV"
         assert learnable_sink is None, (
             "SM100 forward with head_dim=256 does not support learnable_sink"
