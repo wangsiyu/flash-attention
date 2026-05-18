@@ -43,3 +43,10 @@ UT policy for CuteDSL HD256 validation.
 | Hang means idle | GPU 100% with continuing pytest log progress is not a hang. |
 | Fix before rerun | Rerun only after investigating and attempting a fix. |
 | Command handoff | Monitoring must be triggered through `../commands/test.md`. |
+
+## Permanent HD256 Gate Coverage
+
+The monitored `/test` gate must keep all standard HD256 groups enabled:
+`test_flash_attn_output`, `test_flash_attn_varlen_output`, the HD256-only
+dLSE group (`test_flash_attn_lse_grad` and
+`test_flash_attn_lse_grad_unused`), and `test_varlen`.

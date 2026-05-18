@@ -34,7 +34,8 @@ hang.
 
 | Runner | Scope |
 | ------ | ----- |
-| `harness/harness/test/run_hd256_ut.sh` | Runs the three full CuteDSL `head_dim=256` UT groups. Internal only; use `/test` as the command entry. |
+| `harness/harness/test/run_hd256_ut.sh` | Runs the full CuteDSL `head_dim=256` UT gate: output, varlen output, dLSE, and varlen. Internal only; use `/test` as the command entry. |
+| `harness/harness/test/run_hd256_dlse_ut.sh` | Runs only the HD256 dLSE / differentiable-LSE UT group for narrow reproduction. |
 
 The runner must execute import preflight and pytest from `/tmp`, not from the
 repo root. It passes absolute test paths plus `--rootdir=$REPO` and
@@ -53,6 +54,8 @@ using the latest working-tree kernel files.
 | ---- | -------------- |
 | `tests/cute/test_flash_attn.py::test_flash_attn_output` | `d == [256]` |
 | `tests/cute/test_flash_attn.py::test_flash_attn_varlen_output` | `d == [256]` |
+| `tests/cute/test_flash_attn.py::test_flash_attn_lse_grad` | `d == [256]` |
+| `tests/cute/test_flash_attn.py::test_flash_attn_lse_grad_unused` | `d == [256]` |
 | `tests/cute/test_flash_attn_varlen.py::test_varlen` | `D == [256]` |
 
 If any active parametrization is not `[256]`, the internal runner temporarily
@@ -64,6 +67,7 @@ patches it before running.
 | ----- | ----------- | --- |
 | HD256 output | `tests/cute/test_flash_attn.py::test_flash_attn_output` | `harness/logs/test/ut_hd256_output.log` |
 | HD256 varlen output | `tests/cute/test_flash_attn.py::test_flash_attn_varlen_output` | `harness/logs/test/ut_hd256_varlen_output.log` |
+| HD256 dLSE | `tests/cute/test_flash_attn.py::test_flash_attn_lse_grad` and `tests/cute/test_flash_attn.py::test_flash_attn_lse_grad_unused` | `harness/logs/test/ut_hd256_dlse.log` |
 | Varlen | `tests/cute/test_flash_attn_varlen.py::test_varlen` | `harness/logs/test/ut_varlen.log` |
 
 ## Outputs

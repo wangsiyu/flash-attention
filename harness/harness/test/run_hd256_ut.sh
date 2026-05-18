@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the three standard CuteDSL head_dim=256 UT groups sequentially.
+# Run the standard CuteDSL head_dim=256 UT groups sequentially.
 # Usage:
 #   bash harness/harness/test/run_hd256_ut.sh
 #   bash harness/harness/test/run_hd256_ut.sh --preflight-only
@@ -8,6 +8,7 @@
 #   harness/logs/test/preflight.log
 #   harness/logs/test/ut_hd256_output.log
 #   harness/logs/test/ut_hd256_varlen_output.log
+#   harness/logs/test/ut_hd256_dlse.log
 #   harness/logs/test/ut_varlen.log
 
 set -u
@@ -107,6 +108,8 @@ for label, module in [
 targets = [
     (repo / "tests/cute/test_flash_attn.py", "test_flash_attn_output", "d"),
     (repo / "tests/cute/test_flash_attn.py", "test_flash_attn_varlen_output", "d"),
+    (repo / "tests/cute/test_flash_attn.py", "test_flash_attn_lse_grad", "d"),
+    (repo / "tests/cute/test_flash_attn.py", "test_flash_attn_lse_grad_unused", "d"),
     (repo / "tests/cute/test_flash_attn_varlen.py", "test_varlen", "D"),
 ]
 for label, path in [
@@ -193,6 +196,10 @@ run_test_group "hd256 output" "$LOGDIR/ut_hd256_output.log" \
 
 run_test_group "hd256 varlen output" "$LOGDIR/ut_hd256_varlen_output.log" \
     "$TEST_FILE::test_flash_attn_varlen_output"
+
+run_test_group "hd256 dlse" "$LOGDIR/ut_hd256_dlse.log" \
+    "$TEST_FILE::test_flash_attn_lse_grad" \
+    "$TEST_FILE::test_flash_attn_lse_grad_unused"
 
 run_test_group "varlen" "$LOGDIR/ut_varlen.log" \
     "$VARLEN_TEST_FILE::test_varlen"
