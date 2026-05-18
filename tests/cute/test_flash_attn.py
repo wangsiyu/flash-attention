@@ -1564,7 +1564,7 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
@@ -1644,7 +1644,7 @@ def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128, 256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad_unused(seqlen_q, seqlen_k, d, causal, dtype):
