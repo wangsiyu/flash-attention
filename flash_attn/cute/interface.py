@@ -849,8 +849,6 @@ def _flash_attn_fwd(
                     assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
                     assert not use_block_sparsity, \
                         "SM100 forward with head_dim=256 does not support block sparsity"
-                    assert learnable_sink is None, \
-                        "SM100 forward with head_dim=256 does not support learnable_sink"
                     if page_table is not None:
                         assert max_seqlen_k % page_size == 0, (
                             f"SM100 hd256 2CTA paged KV requires max_seqlen_k divisible by "

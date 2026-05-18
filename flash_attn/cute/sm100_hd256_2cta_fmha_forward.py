@@ -7,6 +7,7 @@
 # - hdim 256
 # - varlen
 # - sliding window
+# - learnable sink
 # Unsupported features that will be added later:
 # - score_mod / mask_mod
 # - paged KV
@@ -218,9 +219,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         stream: cuda.CUstream = None,
     ):
         assert mPageTable is None, "SM100 forward with head_dim=256 does not support paged KV"
-        assert learnable_sink is None, (
-            "SM100 forward with head_dim=256 does not support learnable_sink"
-        )
         assert blocksparse_tensors is None, (
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
@@ -877,6 +875,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 pipeline_o_acc,
                 pipeline_sm_stats,
                 sm_stats_barrier,
+                learnable_sink,
                 softmax_scale_log2,
                 block_info,
                 num_splits,
@@ -1578,7 +1577,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         stage ^= 1
                 # Dense path always writes scale / signals
                 sScale[tidx + self.m_block_size] = softmax.row_sum[0]
-                if const_expr(mLSE is not None):
+                if const_expr(mLSE is not None or learnable_sink is not None):
                     sScale[tidx + self.m_block_size * 2] = softmax.row_max[0]
                 sm_stats_barrier.arrive_w_index(index=sm_stats_stage * 4 + warp_idx)
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1598,6 +1597,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         pipeline_o_acc: pipeline.PipelineAsync,
         pipeline_sm_stats,
         sm_stats_barrier,
+        learnable_sink: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         block_info: BlockInfo,
         num_splits: Int32,
@@ -1639,8 +1639,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
             stats = (
                 Float32(0.0),
-                -Float32.inf if const_expr(mLSE is not None) else None,
+                -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None,
                 True,
+            )
+            softmax_scale_log2_eff = softmax_scale_log2
+            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            max_offset_scale = (
+                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
 
             total_block_count = n_block_max - n_block_min
@@ -1670,8 +1675,23 @@ class BlackwellFusedMultiHeadAttentionForward:
                 # Normalize and store the final accumulated O tile.
                 sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
                 row_sum = sScale[tidx + self.m_block_size]
-                row_max = sScale[tidx + self.m_block_size * 2] if const_expr(mLSE is not None) else None
+                row_max = (
+                    sScale[tidx + self.m_block_size * 2]
+                    if const_expr(mLSE is not None or learnable_sink is not None)
+                    else None
+                )
                 pipeline_sm_stats.consumer_release_w_index(0)
+                if const_expr(learnable_sink is not None):
+                    LOG2_E = math.log2(math.e)
+                    sink_val = Float32(learnable_sink[head_idx])
+                    if row_max == -Float32.inf:
+                        row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
+                        row_sum = max_offset_scale
+                    else:
+                        row_sum += cute.math.exp2(
+                            sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset,
+                            fastmath=True,
+                        )
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                 stats = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
@@ -1696,7 +1716,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats
                 LN2 = math.log(2.0)
                 lse = (
-                    (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                    (
+                        row_max * softmax_scale_log2_eff
+                        + (cute.math.log2(row_sum, fastmath=True) - max_offset)
+                    )
+                    * LN2
                     if not acc_O_mn_row_is_zero_or_nan
                     else -Float32.inf
                 )
