@@ -356,8 +356,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        assert mSeqUsedQ is None
-        assert mSeqUsedK is None
         assert mdQ_semaphore is None
         assert mdK_semaphore is None
         assert mdV_semaphore is None
@@ -633,6 +631,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             mdQ_tma,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_Kt,
@@ -679,6 +679,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         mdQ_tma: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_Kt: cute.CopyAtom,
@@ -939,8 +941,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
             tile_m=self.cta_tiler[0],
             tile_n=self.cta_tiler[1],
         )

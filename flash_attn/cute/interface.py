@@ -851,8 +851,6 @@ def _flash_attn_fwd(
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     assert learnable_sink is None, \
                         "SM100 forward with head_dim=256 does not support learnable_sink"
-                    assert seqused_q is None and seqused_k is None, \
-                        "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
                     if page_table is not None:
                         assert max_seqlen_k % page_size == 0, (
                             f"SM100 hd256 2CTA paged KV requires max_seqlen_k divisible by "
@@ -1757,9 +1755,6 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support block sparsity"
                 assert dlse is None, \
                     "SM100 backward with head_dim=256 does not support dlse"
-                assert seqused_q is None and seqused_k is None, \
-                    "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
                 fa_bwd_obj = BlackwellFusedMultiHeadAttentionBackward(
