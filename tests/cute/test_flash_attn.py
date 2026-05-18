@@ -153,8 +153,6 @@ def test_flash_attn_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if causal and seqlen_q > seqlen_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -547,8 +545,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if causal and seqlen_q > seqlen_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
         if zero_lengths_q or zero_lengths_k:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support zero-length sequences yet")
     if (
