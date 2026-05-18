@@ -1753,8 +1753,6 @@ def _flash_attn_bwd(
                 assert softcap == 0.0, "SM100 backward with head_dim=256 does not support softcap"
                 assert block_sparse_tensors is None, \
                     "SM100 backward with head_dim=256 does not support block sparsity"
-                assert dlse is None, \
-                    "SM100 backward with head_dim=256 does not support dlse"
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
                 fa_bwd_obj = BlackwellFusedMultiHeadAttentionBackward(
