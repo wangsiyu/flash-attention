@@ -140,12 +140,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # Generally slower to use store dS in smem for dK, and doesn't work for 2cta
         self.use_smem_dS_for_mma_dK = False
 
-        self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
         self.mma_warp_id = 12
         self.load_warp_id = 13
-        self.relay_warp_id = 14
-        self.empty_warp_id = 15
+        self.empty_warp_ids = (0, 1, 2, 3, 14, 15)
 
         self.num_compute_warps = len(self.compute_warp_ids)
 
@@ -153,12 +151,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.threads_per_warp = cute.arch.WARP_SIZE
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
-                *self.reduce_warp_ids,
+                *self.empty_warp_ids,
                 *self.compute_warp_ids,
                 self.mma_warp_id,
                 self.load_warp_id,
-                self.relay_warp_id,
-                self.empty_warp_id,
             )
         )
 
@@ -169,10 +165,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             barrier_id=int(NamedBarrierBwdSm100.Compute),
             num_threads=len(self.compute_warp_ids) * cute.arch.WARP_SIZE,
         )
-        self.reduce_sync_barrier = cutlass.pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
-            num_threads=len(self.reduce_warp_ids) * cute.arch.WARP_SIZE,
-        )
 
         # TMEM setup
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
@@ -182,19 +174,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.tmem_dP_offset = self.tmem_S_offset + self.tile_m // 2
 
         if (not is_causal and not is_local) or deterministic:
-            self.num_regs_reduce = 136 if self.use_2cta_instrs else 152
             self.num_regs_compute = 136
             self.num_regs_load = 104 if self.use_2cta_instrs else 96 - 8
             self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         else:
-            self.num_regs_reduce = 136 if self.use_2cta_instrs else 136
             self.num_regs_compute = 136 if self.use_2cta_instrs else 144
             self.num_regs_load = 104 if self.use_2cta_instrs else 96 - 8
             self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         self.num_regs_empty = 24
 
         assert (
-            self.num_regs_reduce
+            self.num_regs_empty
             + self.num_regs_compute * 2
             + max(self.num_regs_load, self.num_regs_mma)
             <= 512
@@ -803,7 +793,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE
-            * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
+            * len((self.mma_warp_id, *self.compute_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf,
@@ -945,6 +935,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             defer_sync=False,
         )
 
+        # Cluster arrive after barrier init
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+
         # setup mma
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
@@ -1036,17 +1029,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             window_size_right=window_size_right,
         )
 
-        #  EMPTY
-        # (15)
-        if warp_idx == self.empty_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_empty)
+        # Cluster wait before tensor memory alloc
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        #  RELAY
-        # (14)
-        if warp_idx == self.relay_warp_id:
-            cute.arch.setmaxregister_decrease(
-                self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
-            )
+        #  EMPTY
+        # (0, 1, 2, 3, 14, 15)
+        for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+            if warp_idx == self.empty_warp_ids[i]:
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  LOAD
         # (13)
@@ -1187,15 +1177,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 sdV_layout,
                 sdK_layout,
             )
-            tmem_alloc_barrier.arrive()
-
-
-        # Reduce
-        # (0, 1, 2, 3) - dQ placeholder disabled for the dK/dV-only kernel.
-        if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
-            tmem_ptr = tmem.retrieve_ptr(Float32)
             tmem_alloc_barrier.arrive()
 
     @cute.jit

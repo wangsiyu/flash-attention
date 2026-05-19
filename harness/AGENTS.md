@@ -22,6 +22,7 @@ Auto-invoke based on "When to Use" conditions.
 | [environment](skills/environment.md) | CuteDSL editable setup, FA4 import path, repo-local runtime |
 | [test](skills/test.md) | UT execution policy, fail-fast monitoring, rerun loop |
 | [hang_detect_fix](skills/hang_detect_fix.md) | Hang detection, kill policy, cuda-gdb debug workflow |
+| [hd256_hang_stress](skills/hd256_hang_stress.md) | 4-GPU HD256 FA4 all-to-all infinite hang pressure case |
 | [benchmark](skills/benchmark.md) | Benchmark gate, previous-run comparison, regression handling, SASS export |
 | [refactor](skills/refactor.md) | Refactor requirements, target files, merge-ready code-level alignment, HD256 kernels |
 | [feature_migration](skills/feature_migration.md) | New feature migration from target files into HD256 kernels, feature UT enablement, gate requirements |
@@ -34,6 +35,7 @@ Auto-invoke based on "When to Use" conditions.
 | `/test` | [commands/test.md](commands/test.md) | Run monitored UT with fail-fast and hang detection |
 | `/environment` | [commands/environment.md](commands/environment.md) | Reset and install repo-local CuteDSL FA4 editable runtime |
 | `/hang_detect_fix` | [commands/hang_detect_fix.md](commands/hang_detect_fix.md) | Capture cuda-gdb hang diagnostics for a reproduced hang |
+| `/hd256_hang_stress` | [commands/hd256_hang_stress.md](commands/hd256_hang_stress.md) | Launch fixed 4-GPU all-to-all HD256 hang stress |
 | `/benchmark` | [commands/benchmark.md](commands/benchmark.md) | Run repeated HD256 benchmark and compare with previous run |
 | `/wheel` | [commands/wheel.md](commands/wheel.md) | Build only the repo-local `flash_attn/cute` FA4 wheel into `dist/` |
 | `/commit` | [commands/commit.md](commands/commit.md) | Commit after validation while enforcing harness commit scope |
@@ -47,6 +49,7 @@ Auto-invoke based on "When to Use" conditions.
 | Feature migration, port feature, SWA/local attention | `skills/workflow.md` + `skills/feature_migration.md` + `skills/refactor.md` | Port only target-equivalent code into the current HD256 kernel, enable the feature UT, and run the full gate. |
 | UT, correctness, precision test | `skills/test.md` + `commands/test.md` | Use monitored `/test`; do not call raw pytest from memory. |
 | Hang, stuck UT, GPU 100% | `skills/hang_detect_fix.md` + `commands/hang_detect_fix.md` | Kill broad UT, reproduce case, capture cuda-gdb diagnostics. |
+| Online random hang stress | `skills/hd256_hang_stress.md` + `commands/hd256_hang_stress.md` | Use fixed 4-GPU all-to-all stress; do not disable all-to-all or stage-sync. |
 | Benchmark or performance gate | `skills/benchmark.md` + `commands/benchmark.md` | Run benchmark only after UT passes; block systemic regression. |
 | FA4 wheel or package | `commands/wheel.md` | Build only `../flash_attn/cute` into `dist/`; delete old wheels first. |
 | Commit | `skills/commit.md` + `commands/commit.md` | Enforce commit scope and git identity. |
