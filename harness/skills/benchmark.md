@@ -19,7 +19,7 @@ Performance gate for CuteDSL HD256 work.
 | Signal | Action |
 | ------ | ------ |
 | benchmark, performance, perf | Load `../commands/benchmark.md`. |
-| after UT passes | Run benchmark gate before version lock or commit. |
+| after UT passes | Run benchmark gate before stress, version lock, or commit. |
 | regression | Repeat benchmark, compare medians, export SASS or run equivalent experiment analysis. |
 | SASS | Use benchmark command helper for before/after SASS export. |
 
@@ -32,7 +32,7 @@ Performance gate for CuteDSL HD256 work.
 | B3 Rotate | Keep only current run and previous run for comparison. |
 | B4 Compare | Compare current repeated-run medians against previous repeated-run medians. |
 | B5 Decide | This round passes only if no systemic performance regression is detected. |
-| B6 Commit handoff | Return to `workflow.md` W5/W6 only after B5 passes. |
+| B6 Stress handoff | Return to `workflow.md` W4 and run `hd256_hang_stress.md` before W5/W6. |
 
 ## Regression Policy
 

@@ -83,6 +83,6 @@ patches it before running.
 
 | Result | Next Step |
 | ------ | --------- |
-| UT pass | Proceed to `../skills/benchmark.md` and `../commands/benchmark.md`. |
+| UT pass | Proceed to `../skills/benchmark.md` / `../commands/benchmark.md`; after benchmark passes, run the `../skills/hd256_hang_stress.md` 5000-iteration stress gate. |
 | Failed | Reproduce failed case, fix, rerun `/test`. |
 | Hang | Load `../skills/hang_detect_fix.md` and `hang_detect_fix.md`. |

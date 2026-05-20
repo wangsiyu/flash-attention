@@ -62,3 +62,6 @@ Only current and previous benchmark generations are retained.
 | ------ | ------- |
 | Exit `0` | Benchmark gate passed or no previous baseline exists yet. |
 | Nonzero exit | Benchmark failed or systemic regression detected. Do not lock or commit. |
+
+After benchmark exits `0`, workflow W4 is still incomplete until
+`/hd256_hang_stress` finishes `--max-iters 5000` successfully.

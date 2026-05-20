@@ -69,5 +69,6 @@ for explicit approval before editing outside the current kernel and feature UT.
 | Environment | Pass `workflow.md` W0 before testing. Runtime must import repo-local `flash_attn.cute`. |
 | UT | Enable the feature's relevant UT coverage, then run monitored UT through `test.md`. Raw ad hoc pytest is not the gate. |
 | Benchmark | After UT passes, run `benchmark.md`. Feature migration cannot lock or commit without benchmark. |
+| Stress | After benchmark passes, run the finite `hd256_hang_stress.md` gate with `--max-iters 5000`. Feature migration cannot lock or commit without stress. |
 | Hang | If a run hangs, immediately follow `hang_detect_fix.md`: kill the stale UT, reproduce narrowly, capture diagnostics, and fix before continuing. |
 | Commit | Commit only after workflow W4 passes and W5 lock is explicit. Feature UT changes are allowed only for the migrated feature. |
