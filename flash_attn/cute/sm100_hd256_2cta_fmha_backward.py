@@ -135,9 +135,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
         )
         assert mask_mod is None, "SM100 backward with head_dim=256 does not support mask_mod"
-        assert not deterministic, (
-            "SM100 backward with head_dim=256 does not support deterministic mode"
-        )
         assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
         assert cluster_size in (1, 2), (
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
@@ -159,6 +156,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         self.tile_n_dq = tile_n_dq
         self.tile_m_dkdv = tile_m_dkdv
         self.tile_n_dkdv = tile_n_dkdv
+        self.qhead_per_kvhead = qhead_per_kvhead
         self.use_clc_scheduler = use_clc_scheduler
 
         self.dq_kernel = BlackwellFusedMultiHeadAttentionBackwardDQKernel(
@@ -227,9 +225,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
-        assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
-            "SM100 backward with head_dim=256 does not use semaphores"
-        )
         assert block_sparse_tensors is None, (
             "SM100 backward with head_dim=256 does not support block sparse tensors"
         )
@@ -270,8 +265,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
         K = _as_bshkrd_tensor(K, h_k, 1, varlen)
         V = _as_bshkrd_tensor(V, h_k, 1, varlen)
         dQ = _as_bshkrd_tensor(dQ, h_k, h_r, varlen)
-        dK = _as_bshkrd_tensor(dK, h_k, 1, varlen)
-        dV = _as_bshkrd_tensor(dV, h_k, 1, varlen)
+        if cutlass.const_expr(self.qhead_per_kvhead == 1):
+            dK = _as_bshkrd_tensor(dK, h_k, 1, varlen)
+            dV = _as_bshkrd_tensor(dV, h_k, 1, varlen)
         dO = _as_bshkrd_tensor(dO, h_k, h_r, varlen)
         scaled_LSE = _as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
         sum_OdO = _as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
@@ -292,9 +288,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
             mSeqUsedK=seqused_k,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
-            mdQ_semaphore=dQ_semaphore,
-            mdK_semaphore=dK_semaphore,
-            mdV_semaphore=dV_semaphore,
+            mdQ_semaphore=None,
+            mdK_semaphore=None,
+            mdV_semaphore=None,
             stream=stream,
         )
         self.dkdv_kernel(
@@ -313,5 +309,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             mSeqUsedK=seqused_k,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            mdK_semaphore=dK_semaphore,
+            mdV_semaphore=dV_semaphore,
             stream=stream,
         )
