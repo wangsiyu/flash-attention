@@ -7,7 +7,8 @@ script: ../harness/commit/commit.sh
 
 # Commit
 
-Commit command with harness scope checks.
+Commit command with harness scope checks. Use only after workflow W4 has passed:
+monitored UT, benchmark, and the 5000-iteration HD256 hang stress gate.
 
 ## Invocation
 
@@ -22,7 +23,7 @@ Commit command with harness scope checks.
 
 | Type | Staging Behavior | Scope Check |
 | ---- | ---------------- | ----------- |
-| `refactor` | Script stages only the three allowed HD256 kernel files. | Fails if staged files include anything else or any `tests/` path. |
+| `refactor` | Script stages only the allowed HD256 kernel files. | Fails if staged files include anything else or any `tests/` path. |
 | `harness` | Script stages only `harness/` files. | Fails if staged files include anything outside `harness/` or any `tests/` path. |
 | `feature` | Script does not auto-stage. Caller must stage intended files first. | Tests are allowed only in this explicit mode. |
 

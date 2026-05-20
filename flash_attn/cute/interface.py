@@ -846,7 +846,9 @@ def _flash_attn_fwd(
             else:
                 if use_dedicated_hd256_kernel:
                     # hd=256 2CTA forward: check for currently unsupported features
-                    assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
+                    assert score_mod is None or softcap is not None, (
+                        "SM100 forward with head_dim=256 only supports softcap score_mod"
+                    )
                     assert not use_block_sparsity, \
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     if page_table is not None:
@@ -1748,7 +1750,11 @@ def _flash_attn_bwd(
             )
         else:
             if use_dedicated_hd256_kernel:
-                assert softcap == 0.0, "SM100 backward with head_dim=256 does not support softcap"
+                assert (
+                    score_mod is None and score_mod_bwd is None
+                ) or softcap != 0.0, (
+                    "SM100 backward with head_dim=256 only supports softcap score_mod"
+                )
                 assert block_sparse_tensors is None, \
                     "SM100 backward with head_dim=256 does not support block sparsity"
                 dq_tile_mn = (128, 128)

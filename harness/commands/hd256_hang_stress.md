@@ -10,7 +10,7 @@ logs: ../harness/logs/hang_stress/
 
 Fixed 4-GPU all-to-all HD256 FA4 hang pressure command.
 
-## Launch
+## Gate Launch
 
 ```bash
 env NCCL_DEBUG=WARN STRESS_TIMEOUT_SECONDS=0 VERIFY_ENV=0 NPROC=4 \
@@ -20,9 +20,13 @@ env NCCL_DEBUG=WARN STRESS_TIMEOUT_SECONDS=0 VERIFY_ENV=0 NPROC=4 \
   --log-interval 10 \
   --sync-every 1 \
   --async-a2a \
+  --max-iters 5000 \
   --calls-per-iter 24 \
   --state-every-iters 1
 ```
+
+This is the required workflow stress gate. It must complete 5000 outer
+iterations and exit `0`.
 
 For the cuda-gdb dK/dV trap case whose kernel grid was `(168,1,1)`, switch to
 the targeted shape and raise calls per iteration:
@@ -35,6 +39,7 @@ env NCCL_DEBUG=WARN STRESS_TIMEOUT_SECONDS=0 VERIFY_ENV=0 NPROC=4 \
   --log-interval 10 \
   --sync-every 1 \
   --async-a2a \
+  --max-iters 5000 \
   --calls-per-iter 96 \
   --state-every-iters 1
 ```
@@ -55,6 +60,7 @@ setsid bash -lc 'cd /mnt/workspace/siyu.wsy/qoder_workspace/flash-attention && e
 | Communication | all-to-all enabled for Q/K/V dispatch, O combine, dO dispatch, and dQ/dK/dV combine. |
 | FA calls | direct `_flash_attn_fwd` and `_flash_attn_bwd`, not the high-level interface. |
 | Iteration | `24` forward+backward calls followed by one `cuda.synchronize()`. |
+| Gate length | `--max-iters 5000`; do not shorten the gate run. |
 | Trace | state files written once per iteration; no stage trace by default. |
 
 ## Logs

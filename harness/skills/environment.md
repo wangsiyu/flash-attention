@@ -26,8 +26,8 @@ Repo-local runtime rules for CuteDSL FA4 (`flash_attn/cute`).
 ## Editable Runtime
 
 Editable setup is the first environment action in a fresh or suspicious
-workspace. Before the first import-path check, preflight, UT, benchmark, wheel
-build, or commit gate, run `bash harness/harness/environment/setup_fa4_editable.sh`.
+workspace. Before the first import-path check, preflight, UT, benchmark, stress,
+wheel build, or commit gate, run `bash harness/harness/environment/setup_fa4_editable.sh`.
 This resets stale CuteDSL runtime components, reinstalls the repo-supported
 runtime packages, and installs the current checkout's CuteDSL FA4 package with
 `python3 -m pip install --no-deps -e flash_attn/cute`.

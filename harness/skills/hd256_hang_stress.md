@@ -19,6 +19,7 @@ triggers:
 | ------ | ------ |
 | Random online hang, low-probability hang, long pressure test | Run the fixed 4-GPU all-to-all stress command. |
 | Need GPU pressure while preserving online topology | Use `heavy_h16_q8192_k8192_b2`; do not disable all-to-all. |
+| Workflow gate after benchmark | Run the finite gate command with `--max-iters 5000`. |
 | Need to target the cuda-gdb `GridDim.x=168` dK/dV trap | Use `gdb_grid168_q1024_k2560_b2` first, then `gdb_grid168_q1024_k2432_b3`. |
 | Need debug state for a stuck run | Read `harness/harness/logs/hang_stress/<run>/state/rank*.txt`. |
 
@@ -36,8 +37,9 @@ triggers:
 | `max_seqlen_q` / `max_seqlen_k` | `8192` |
 | Causal | `True` |
 | Iteration shape | `24` forward+backward calls, then one sync |
+| Gate length | `5000` outer iterations |
 
-## Required Command
+## Gate Command
 
 Use the command documented in `../commands/hd256_hang_stress.md`.
 
@@ -49,15 +51,20 @@ env NCCL_DEBUG=WARN STRESS_TIMEOUT_SECONDS=0 VERIFY_ENV=0 NPROC=4 \
   --log-interval 10 \
   --sync-every 1 \
   --async-a2a \
+  --max-iters 5000 \
   --calls-per-iter 24 \
   --state-every-iters 1
 ```
+
+This is the workflow gate command. It must finish all 5000 iterations and exit
+zero before W4 can pass. Infinite stress is only for dedicated hang hunting, not
+for the normal workflow gate.
 
 For the `tcgen05_guardrail_trap_unallocated_columns_being_dealloced` dK/dV
 site with `GridDim.x=168`, use the same command shape with:
 
 ```bash
---case gdb_grid168_q1024_k2560_b2 --calls-per-iter 96
+--case gdb_grid168_q1024_k2560_b2 --max-iters 5000 --calls-per-iter 96
 ```
 
 ## Hard Rules
@@ -67,6 +74,8 @@ site with `GridDim.x=168`, use the same command shape with:
 | Four ranks | Keep `NPROC=4`; one rank per GPU. |
 | Four-GPU communication | All-to-all must remain enabled. Never pass `--disable-a2a` for this skill. |
 | Direct FA4 calls | Use `_flash_attn_fwd` and `_flash_attn_bwd` through `harness/harness/benchmark/hd256_hang_stress_4gpu.py`. |
+| Gate length | Normal workflow stress gate is exactly `--max-iters 5000`. Do not shorten it to save time. |
+| Infinite mode | Use `--max-iters 0` only when the user explicitly asks for ongoing hang hunting. |
 | Low trace overhead | Do not enable `--stage-trace` during pressure runs. Keep state writes at iteration granularity. |
 | Sync granularity | Do not sync around each all-to-all or FA stage. Sync only after the full outer iteration. |
 | Runtime source | Run from the repo-local editable `flash_attn/cute`; never patch `flash_attn/__init__.py`. |

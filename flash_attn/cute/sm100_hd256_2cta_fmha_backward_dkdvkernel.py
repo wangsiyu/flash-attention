@@ -85,13 +85,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             "SM100 HD256 dK/dV kernel only supports tile_m=128 and tile_n=64"
         )
 
-        self.use_2cta_instrs = bool(
-            use_2cta_instrs
-            and cluster_size == 2
-            and score_mod is None
-            and score_mod_bwd is None
-            and mask_mod is None
-        )
+        self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2 and mask_mod is None)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
         assert self.use_2cta_instrs, "SM100 HD256 dK/dV kernel requires use_2cta_instrs=True"
@@ -1835,6 +1829,109 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cute.autovec_copy(regs_copy, smem_copy_slice)
 
     @cute.jit
+    def apply_score_mod(
+        self,
+        tSrS_t2r,
+        tScS_t2r,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax_scale,
+        seqlen_info,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply forward score modification for SM100 backward pass."""
+        n_vals = cutlass.const_expr(cute.size(tSrS_t2r.shape))
+        score_vec = cute.make_rmem_tensor(self.vec_size, self.qk_acc_dtype)
+        q_idx_vec = cute.make_rmem_tensor(self.vec_size, Int32)
+        kv_idx_vec = cute.make_rmem_tensor(self.vec_size, Int32)
+        batch_idx_ssa = utils.scalar_to_ssa(batch_idx, Int32).broadcast_to((self.vec_size,))
+
+        for i in cutlass.range(0, n_vals, self.vec_size, unroll_full=True):
+            for j in cutlass.range(self.vec_size, unroll_full=True):
+                score_vec[j] = tSrS_t2r[i + j] * softmax_scale
+                kv_idx_vec[j] = (
+                    tScS_t2r[i + j][0] + n_block * self.cta_group_size * self.tile_n
+                )
+                q_idx_vec[j] = tScS_t2r[i + j][1] + m_block * self.tile_m
+
+            score_ssa = score_vec.load()
+            q_idx_ssa = q_idx_vec.load()
+            kv_idx_ssa = kv_idx_vec.load()
+            head_idx_ssa = utils.scalar_to_ssa(head_idx, Int32).broadcast_to((self.vec_size,))
+            aux_args = []
+
+            post_mod_scores = self.score_mod(
+                score_ssa,
+                batch_idx_ssa,
+                head_idx_ssa,
+                q_idx=q_idx_ssa,
+                kv_idx=kv_idx_ssa,
+                seqlen_info=seqlen_info,
+                aux_tensors=aux_args,
+            )
+
+            score_vec.store(post_mod_scores)
+            for j in cutlass.range(self.vec_size, unroll_full=True):
+                tSrS_t2r[i + j] = score_vec[j]
+
+    @cute.jit
+    def apply_score_mod_bwd(
+        self,
+        grad_tensor,
+        score_tensor,
+        index_tensor,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax_scale,
+        seqlen_info,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply backward score modification (joint graph) for SM100."""
+        n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
+        grad_vec = cute.make_fragment(self.vec_size, self.qk_acc_dtype)
+        score_vec = cute.make_fragment(self.vec_size, self.qk_acc_dtype)
+        q_idx_vec = cute.make_fragment(self.vec_size, Int32)
+        kv_idx_vec = cute.make_fragment(self.vec_size, Int32)
+        batch_idx_ssa = utils.scalar_to_ssa(batch_idx, Int32).broadcast_to((self.vec_size,))
+
+        for i in cutlass.range(0, n_vals, self.vec_size, unroll_full=True):
+            for j in cutlass.range(self.vec_size, unroll_full=True):
+                grad_vec[j] = grad_tensor[i + j]
+                score_vec[j] = score_tensor[i + j] * softmax_scale
+                kv_idx_vec[j] = (
+                    index_tensor[i + j][0] + n_block * self.cta_group_size * self.tile_n
+                )
+                q_idx_vec[j] = index_tensor[i + j][1] + m_block * self.tile_m
+
+            grad_ssa = grad_vec.load()
+            score_ssa = score_vec.load()
+            q_idx_ssa = q_idx_vec.load()
+            kv_idx_ssa = kv_idx_vec.load()
+            head_idx_ssa = utils.scalar_to_ssa(head_idx, Int32).broadcast_to((self.vec_size,))
+            aux_args = []
+
+            grad_out_ssa = self.score_mod_bwd(
+                grad_ssa,
+                score_ssa,
+                batch_idx_ssa,
+                head_idx_ssa,
+                q_idx=q_idx_ssa,
+                kv_idx=kv_idx_ssa,
+                seqlen_info=seqlen_info,
+                aux_tensors=aux_args,
+            )
+
+            grad_vec.store(grad_out_ssa)
+            for j in cutlass.range(self.vec_size, unroll_full=True):
+                grad_tensor[i + j] = grad_vec[j]
+
+    @cute.jit
     def compute_loop(
         self,
         thr_mma_S: cute.core.ThrMma,
@@ -2026,6 +2123,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cute.copy(thr_copy_t2r_smem, tStS_t2r, tSrS_t2r)
                 cute.arch.fence_view_async_tmem_load()
 
+                if const_expr(self.score_mod_bwd is not None):
+                    tSrS_pre = cute.make_fragment_like(tSrS_t2r)
+                    cute.autovec_copy(tSrS_t2r, tSrS_pre)
+                if const_expr(self.score_mod is not None):
+                    self.apply_score_mod(
+                        tSrS_t2r,
+                        tScS_t2r,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        n_block_for_cluster,
+                        softmax_scale,
+                        seqlen,
+                    )
+
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen_q_cur_batch
                 mask_fn(
@@ -2118,6 +2230,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         (tSrS_t2r[v], tSrS_t2r[v + 1]),
                         (tdPrdP_t2r[v], tdPrdP_t2r[v + 1]),
                     )
+                if const_expr(self.score_mod_bwd is not None):
+                    self.apply_score_mod_bwd(
+                        tdPrdP_t2r,
+                        tSrS_pre,
+                        tScS_t2r,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        n_block_for_cluster,
+                        softmax_scale,
+                        seqlen,
+                    )
+                    for i in cutlass.range(cute.size(tdPrdP_t2r), unroll_full=True):
+                        kv_idx = (
+                            tScS_t2r[i][0]
+                            + n_block_for_cluster * self.cta_group_size * self.tile_n
+                        )
+                        tdPrdP_t2r[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_t2r[i]
                 tdPrdS = cute.make_rmem_tensor(tdPrdP_t2r.shape, mdV.element_type)
                 utils.cvt_f16(tdPrdP_t2r, tdPrdS)
 
