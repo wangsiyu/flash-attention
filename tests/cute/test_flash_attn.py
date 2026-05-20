@@ -147,8 +147,6 @@ def test_flash_attn_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
     device = "cuda"
@@ -343,7 +341,6 @@ def test_flash_attn_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and softcap == 0.0
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
@@ -537,8 +534,6 @@ def test_flash_attn_varlen_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
     if (

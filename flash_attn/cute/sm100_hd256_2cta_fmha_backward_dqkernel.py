@@ -40,6 +40,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 
 
 class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
@@ -87,8 +88,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         assert not deterministic
         assert cluster_size == 2
         assert self.use_2cta_instrs
-        assert score_mod is None
-        assert score_mod_bwd is None
         assert mask_mod is None
         assert not has_aux_tensors
 
@@ -1652,6 +1651,65 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 ) + (None,) * (rank - 4)
         return t[coord]
 
+    @cute.jit
+    def apply_score_mod(
+        self,
+        tSrS_t2r,
+        tScS_idx,
+        batch_idx,
+        head_idx,
+        softmax_scale,
+        seqlen_info,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply forward score modification for SM100 backward pass."""
+        apply_score_mod_inner(
+            tSrS_t2r,
+            tScS_idx,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            aux_tensors,
+            fastdiv_mods,
+            seqlen_info,
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        )
+
+    @cute.jit
+    def apply_score_mod_bwd(
+        self,
+        grad_tensor,
+        score_tensor,
+        tScS_idx,
+        batch_idx,
+        head_idx,
+        softmax_scale,
+        seqlen_info,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply backward score modification (joint graph) for SM100."""
+        apply_score_mod_bwd_inner(
+            grad_tensor,
+            score_tensor,
+            tScS_idx,
+            self.score_mod_bwd,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            aux_tensors,
+            fastdiv_mods,
+            seqlen_info,
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        )
 
     @cute.jit
     def compute_loop(
@@ -1756,7 +1814,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         consumer_state_dPsum = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
-        softmax_scale_log2 = scale_softmax * cutlass.Float32(math.log2(math.e))
+        LOG2_E = math.log2(math.e)
+        if const_expr(self.score_mod is None):
+            softmax_scale_log2 = scale_softmax * LOG2_E
+        else:
+            softmax_scale_log2 = LOG2_E
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1826,6 +1888,31 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 cute.arch.fence_view_async_tmem_load()
                 pipeline_S_P.consumer_release(consumer_state_S_P)
                 consumer_state_S_P.advance()
+                num_stages = cute.size(tScS_t2r, mode=[1])
+                if const_expr(self.score_mod_bwd is not None):
+                    tSrS_pre = cute.make_fragment_like(tSrS_t2r)
+                    cute.autovec_copy(tSrS_t2r, tSrS_pre)
+                if const_expr(self.score_mod is not None or self.score_mod_bwd is not None):
+                    cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
+                    cS = cute.domain_offset(
+                        (
+                            m_block_cta_group * self.qk_mma_tiler[0],
+                            n_block * self.qk_mma_tiler[1],
+                        ),
+                        cS,
+                    )
+                    tScS_idx = thr_copy_t2r.partition_D(thr_mma_S.partition_C(cS))
+                if const_expr(self.score_mod is not None):
+                    self.apply_score_mod(
+                        tSrS_t2r,
+                        tScS_idx,
+                        batch_idx,
+                        head_idx,
+                        scale_softmax,
+                        seqlen,
+                        aux_tensors=None,
+                        fastdiv_mods=(None, None),
+                    )
                 check_q_boundary = (m_block_cta_group + 1) * self.qk_mma_tiler[0] > seqlen_q
                 mask_fn(
                     tSrS_t2r,
@@ -1833,7 +1920,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     thr_tmem_load=thr_copy_t2r,
                     check_q_boundary=check_q_boundary,
                 )
-                num_stages = cute.size(tScS_t2r, mode=[1])
                 lane_idx = cute.arch.lane_idx()
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
@@ -1902,6 +1988,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                         )
+                    if const_expr(self.score_mod_bwd is not None):
+                        tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
+                        tScS_idx_cur = tScS_idx[None, stage, 0, 0]
+                        self.apply_score_mod_bwd(
+                            tdPrdP_cur,
+                            tSrS_pre_cur,
+                            tScS_idx_cur,
+                            batch_idx,
+                            head_idx,
+                            scale_softmax,
+                            seqlen,
+                            aux_tensors=None,
+                            fastdiv_mods=(None, None),
+                        )
+                        for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
+                            kv_idx = tScS_idx_cur[i][1]
+                            tdPrdP_cur[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_cur[i]
+                    for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                             (scale_softmax, scale_softmax),

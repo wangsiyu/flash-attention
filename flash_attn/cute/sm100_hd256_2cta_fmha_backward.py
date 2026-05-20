@@ -134,9 +134,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert tile_m_dkdv == 128 and tile_n_dkdv == 64, (
             "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
         )
-        assert score_mod is None and score_mod_bwd is None and mask_mod is None, (
-            "SM100 backward with head_dim=256 does not support score_mod/mask_mod"
-        )
+        assert mask_mod is None, "SM100 backward with head_dim=256 does not support mask_mod"
         assert not deterministic, (
             "SM100 backward with head_dim=256 does not support deterministic mode"
         )

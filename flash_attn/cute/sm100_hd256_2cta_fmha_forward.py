@@ -8,8 +8,9 @@
 # - varlen
 # - sliding window
 # - learnable sink
+# - softcap
 # Unsupported features that will be added later:
-# - score_mod / mask_mod
+# - custom score_mod / mask_mod
 # - paged KV
 # - split-kv
 
@@ -50,7 +51,7 @@ from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from flash_attn.cute.pack_gqa import pack_gqa_layout
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.softmax import SoftmaxSm100
+from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 
 
@@ -85,7 +86,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 dedicated kernel only supports (head_dim, head_dim_v) = (256, 256)"
         )
         assert head_dim % hdim_multiple_of == 0 and head_dim_v % hdim_multiple_of == 0
-        assert score_mod is None, "SM100 forward with head_dim=256 does not support score_mod"
         assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
         assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
         assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
@@ -1473,8 +1473,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
 
             max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
-            softmax_scale_log2_eff = softmax_scale_log2
-            softmax_scale_eff = None
+            if const_expr(self.score_mod is None):
+                softmax_scale_log2_eff = softmax_scale_log2
+                softmax_scale_eff = None
+            else:
+                softmax_scale_log2_eff = softmax_scale_log2
+                softmax_scale_eff = softmax_scale
             rescale_threshold = 0.0
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
@@ -1788,6 +1792,21 @@ class BlackwellFusedMultiHeadAttentionForward:
         tSrS_t2r = cute.make_fragment(tScS_t2r.shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         cute.arch.fence_view_async_tmem_load()
+        if cutlass.const_expr(self.score_mod is not None):
+            self.apply_score_mod(
+                tSrS_t2r,
+                thr_tmem_load,
+                thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax,
+                seqlen,
+                aux_tensors,
+                fastdiv_mods,
+                head_divmod,
+            )
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block, thr_tmem_load=thr_tmem_load)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
@@ -1837,6 +1856,51 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_si_consumer_phase ^ phase_advance,
             sm_stats_producer_phase ^ 1,
             p_lastsplit_producer_phase ^ phase_advance,
+        )
+
+    @cute.jit
+    def apply_score_mod(
+        self,
+        tSrS_t2r,
+        thr_tmem_load,
+        thr_mma_qk,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax,
+        seqlen: SeqlenInfoQK,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+        head_divmod=None,
+    ):
+        """Apply score modification for SM100 (constant q_idx)."""
+        # Prepare index tensor with extra partition
+        cS = cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1]))
+        cS = cute.domain_offset(
+            (m_block * self.m_block_size, n_block * self.n_block_size), cS
+        )
+        tScS = thr_mma_qk.partition_C(cS)
+        tScS = tScS[(None, None), 0, 0]
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+
+        # Shared q_idx for all scores
+        q_idx_logical = tScS_t2r[0][0]
+
+        apply_score_mod_inner(
+            tSrS_t2r,
+            tScS_t2r,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax.softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            aux_tensors,
+            fastdiv_mods,
+            seqlen_info=seqlen,
+            constant_q_idx=q_idx_logical,
+            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
 
     @cute.jit
