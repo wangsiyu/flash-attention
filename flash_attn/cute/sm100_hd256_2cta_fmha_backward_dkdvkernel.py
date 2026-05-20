@@ -140,14 +140,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # Generally slower to use store dS in smem for dK, and doesn't work for 2cta
         self.use_smem_dS_for_mma_dK = False
 
-        self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
-        self.mma_warp_id = 12
-        self.load_warp_id = 13
-        self.empty_warp_ids = (0, 1, 2, 3, 14, 15)
+        self.compute_warp_ids = (0, 1, 2, 3, 4, 5, 6, 7)
+        self.mma_warp_id = 8
+        self.load_warp_id = 9
+        self.empty_warp_ids = (10, 11)
 
         self.num_compute_warps = len(self.compute_warp_ids)
 
-        # 16 warps -> 512 threads
+        # 12 warps -> 384 threads
         self.threads_per_warp = cute.arch.WARP_SIZE
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -184,9 +184,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.num_regs_empty = 24
 
         assert (
-            self.num_regs_empty
-            + self.num_regs_compute * 2
-            + max(self.num_regs_load, self.num_regs_mma)
+            self.num_regs_compute * 2
+            + max(self.num_regs_load, self.num_regs_mma, self.num_regs_empty)
             <= 512
         )
         self.buffer_align_bytes = 1024
@@ -1033,13 +1032,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
         #  EMPTY
-        # (0, 1, 2, 3, 14, 15)
+        # (10, 11)
         for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
             if warp_idx == self.empty_warp_ids[i]:
                 cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  LOAD
-        # (13)
+        # (9)
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
             self.load(
@@ -1085,7 +1084,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
 
         #  MMA
-        # (12)
+        # (8)
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_mma)
 
@@ -1134,7 +1133,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
 
         # Compute
-        # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
+        # (0, 1, 2, 3, 4, 5, 6, 7) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
             tmem.wait_for_alloc()
@@ -1894,8 +1893,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sLSE_2D = layout_utils.transpose_view(sLSE_2D)
             sdPsum_2D = layout_utils.transpose_view(sdPsum_2D)
 
-        # tix: [128...384]  8 warps
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())  # 4-11
+        # tix: [0...256]  8 warps
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())  # 0-7
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.compute_warp_ids))
         dp_idx = tidx % 128
         num_wg = len(self.compute_warp_ids) // 4  # 2

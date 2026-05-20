@@ -169,11 +169,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.tmem_warp_shape_mn = (4, 1)
         self.use_semantic_trip_range = self.is_causal or self.is_local
 
-        # Warp layout (HD256 dQ-only): 12 warps -> 384 threads
+        # Warp layout (HD256 dQ-only): 8 warps -> 256 threads
         self.compute_warp_ids = (0, 1, 2, 3)  # 4 warps
-        self.mma_warp_id = 8
-        self.load_warp_id = 9
-        self.empty_warp_id = (4, 5, 6, 7, 10, 11)
+        self.mma_warp_id = 4
+        self.load_warp_id = 5
+        self.empty_warp_id = (6, 7)
         self.softmax0_warp_ids = self.compute_warp_ids
         self.softmax1_warp_ids = ()
         self.correction_warp_ids = ()
@@ -958,7 +958,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         )
 
         #  EMPTY
-        # (4, 5, 6, 7, 10, 11)
+        # (6, 7)
         for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
             if warp_idx == self.empty_warp_id[_i]:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
@@ -967,7 +967,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
         #  LOAD
-        # (9)
+        # (5)
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
@@ -1008,7 +1008,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             )
 
         #  MMA
-        # (8)
+        # (4)
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
 
@@ -1699,7 +1699,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             ),
         )
 
-        # tix: [128...384] 8 warps
+        # tix: [0...128] 4 warps
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.compute_warp_ids))
         num_wg = len(self.compute_warp_ids) // 4
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
