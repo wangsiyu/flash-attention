@@ -8,6 +8,7 @@ import cuda.bindings.driver as cuda
 import math
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute import FastDivmodDivisor
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.cute.nvgpu import cpasync
 from cutlass import const_expr
@@ -88,7 +89,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         assert cluster_size == 2
         assert self.use_2cta_instrs
         assert mask_mod is None
-        assert not has_aux_tensors
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -357,7 +357,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         assert mdQ_semaphore is None
         assert mdK_semaphore is None
         assert mdV_semaphore is None
-        assert aux_tensors is None
         assert blocksparse_tensors is None
 
         self.q_dtype = mQ.element_type
@@ -616,6 +615,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
 
+        fastdiv_mods = None
+        if const_expr(aux_tensors is not None):
+            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_k = cute.size(mK.shape[0])
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+            assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
+                "Variable sequence length is not supported yet for aux tensors in bwd"
+            )
+
         # Launch the kernel synchronously
         self.kernel(
             tma_tensor_Q,
@@ -654,6 +664,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             window_size_left,
             window_size_right,
             tile_sched_params,
+            aux_tensors,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -704,6 +716,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tile_sched_params: SingleTileScheduler.Params
         | SingleTileVarlenScheduler.Params
         | SingleTileLPTBwdScheduler.Params,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1077,6 +1091,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                aux_tensors,
+                fastdiv_mods,
             )
             self.tmem_alloc_barrier.arrive()
 
@@ -1654,15 +1670,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     def apply_score_mod(
         self,
         tSrS_t2r,
-        tScS_idx,
+        thr_copy_t2r,
+        thr_mma_S,
         batch_idx,
         head_idx,
+        m_block,
+        n_block,
         softmax_scale,
         seqlen_info,
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
         """Apply forward score modification for SM100 backward pass."""
+        cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
+        cS = cute.domain_offset(
+            (m_block * self.qk_mma_tiler[0], n_block * self.qk_mma_tiler[1]), cS
+        )
+        tScS = thr_mma_S.partition_C(cS)
+        tScS_idx = thr_copy_t2r.partition_D(tScS)
+
         apply_score_mod_inner(
             tSrS_t2r,
             tScS_idx,
@@ -1684,7 +1710,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self,
         grad_tensor,
         score_tensor,
-        tScS_idx,
+        index_tensor,
         batch_idx,
         head_idx,
         softmax_scale,
@@ -1696,7 +1722,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         apply_score_mod_bwd_inner(
             grad_tensor,
             score_tensor,
-            tScS_idx,
+            index_tensor,
             self.score_mod_bwd,
             batch_idx,
             head_idx,
@@ -1737,6 +1763,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         block_info,
         SeqlenInfoCls,
         TileSchedulerCls,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
     ):
         # This dQ kernel computes S = Q @ K.T, so accumulator coordinates are (q, k).
         # Keep LSE/dPsum indexed by q; flash_bwd_sm100.py transposes these views because
@@ -1891,26 +1919,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if const_expr(self.score_mod_bwd is not None):
                     tSrS_pre = cute.make_fragment_like(tSrS_t2r)
                     cute.autovec_copy(tSrS_t2r, tSrS_pre)
-                if const_expr(self.score_mod is not None or self.score_mod_bwd is not None):
-                    cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
-                    cS = cute.domain_offset(
-                        (
-                            m_block_cta_group * self.qk_mma_tiler[0],
-                            n_block * self.qk_mma_tiler[1],
-                        ),
-                        cS,
-                    )
-                    tScS_idx = thr_copy_t2r.partition_D(thr_mma_S.partition_C(cS))
                 if const_expr(self.score_mod is not None):
                     self.apply_score_mod(
                         tSrS_t2r,
-                        tScS_idx,
+                        thr_copy_t2r,
+                        thr_mma_S,
                         batch_idx,
                         head_idx,
+                        m_block_cta_group,
+                        n_block,
                         scale_softmax,
                         seqlen,
-                        aux_tensors=None,
-                        fastdiv_mods=(None, None),
+                        aux_tensors=aux_tensors,
+                        fastdiv_mods=fastdiv_mods,
                     )
                 check_q_boundary = (m_block_cta_group + 1) * self.qk_mma_tiler[0] > seqlen_q
                 mask_fn(
@@ -1989,7 +2010,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         )
                     if const_expr(self.score_mod_bwd is not None):
                         tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
-                        tScS_idx_cur = tScS_idx[None, stage, 0, 0]
+                        cS_bwd = cute.make_identity_tensor(
+                            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+                        )
+                        cS_bwd = cute.domain_offset(
+                            (
+                                m_block_cta_group * self.qk_mma_tiler[0],
+                                n_block * self.qk_mma_tiler[1],
+                            ),
+                            cS_bwd,
+                        )
+                        tScS_bwd = thr_mma_S.partition_C(cS_bwd)
+                        tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
+                        tScS_idx_cur = tScS_idx_bwd[None, stage, 0, 0]
                         self.apply_score_mod_bwd(
                             tdPrdP_cur,
                             tSrS_pre_cur,
@@ -1998,8 +2031,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             head_idx,
                             scale_softmax,
                             seqlen,
-                            aux_tensors=None,
-                            fastdiv_mods=(None, None),
+                            aux_tensors=aux_tensors,
+                            fastdiv_mods=fastdiv_mods,
                         )
                         for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
                             kv_idx = tScS_idx_cur[i][1]
