@@ -50,3 +50,5 @@ The monitored `/test` gate must keep all standard HD256 groups enabled:
 `test_flash_attn_output`, `test_flash_attn_varlen_output`, the HD256-only
 dLSE group (`test_flash_attn_lse_grad` and
 `test_flash_attn_lse_grad_unused`), and `test_varlen`.
+For score_mod feature work, the HD256 score_mod subset in
+`tests/cute/test_score_mod.py` must also remain enabled in the monitored gate.
