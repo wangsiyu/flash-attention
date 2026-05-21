@@ -8,7 +8,12 @@ REPO="$(cd "$HARNESS_ROOT/.." && pwd)"
 LOG_ROOT="$HARNESS_CODE_ROOT/logs/benchmark"
 CURRENT_DIR="$LOG_ROOT/current"
 PREVIOUS_DIR="$LOG_ROOT/previous"
+SOURCE_STAMP="$CURRENT_DIR/source_stamp.log"
 RUNS="${BENCHMARK_RUNS:-3}"
+REP="${BENCHMARK_REP:-50}"
+WARMUP="${BENCHMARK_WARMUP:-10}"
+SDPA_REP="${BENCHMARK_SDPA_REP:-$REP}"
+SDPA_WARMUP="${BENCHMARK_SDPA_WARMUP:-$WARMUP}"
 DRY_RUN=0
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -18,11 +23,17 @@ fi
 CMD=(
     python3
     "$REPO/harness/harness/benchmark/bench_sm100_hd256.py"
-    --compare-baseline
-    --nheads 16
-    --nheads-kv 16
-    --rep 50
-    --warmup 10
+    --suite gate
+    --rep "$REP"
+    --warmup "$WARMUP"
+)
+SDPA_CMD=(
+    python3
+    "$REPO/harness/harness/benchmark/bench_sm100_hd256.py"
+    --suite gate
+    --sdpa-only
+    --rep "$SDPA_REP"
+    --warmup "$SDPA_WARMUP"
 )
 
 mkdir -p "$LOG_ROOT"
@@ -30,21 +41,32 @@ mkdir -p "$LOG_ROOT"
 echo "[benchmark] repo=$REPO"
 echo "[benchmark] logs=$LOG_ROOT"
 echo "[benchmark] runs=$RUNS"
+echo "[benchmark] rep=$REP"
+echo "[benchmark] warmup=$WARMUP"
+echo "[benchmark] sdpa_rep=$SDPA_REP"
+echo "[benchmark] sdpa_warmup=$SDPA_WARMUP"
 echo "[benchmark] command=${CMD[*]}"
+echo "[benchmark] sdpa_command=${SDPA_CMD[*]}"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
 fi
 
-rm -rf "$PREVIOUS_DIR"
 if [[ -d "$CURRENT_DIR" ]]; then
-    mv "$CURRENT_DIR" "$PREVIOUS_DIR"
+    if [[ -f "$CURRENT_DIR/benchmark_report.md" ]]; then
+        rm -rf "$PREVIOUS_DIR"
+        mv "$CURRENT_DIR" "$PREVIOUS_DIR"
+    else
+        echo "[benchmark] discarding incomplete current benchmark directory: $CURRENT_DIR"
+        rm -rf "$CURRENT_DIR"
+    fi
 fi
 mkdir -p "$CURRENT_DIR"
 
 (
     cd /tmp
-    REPO="$REPO" python3 - <<'PY'
+    echo "[benchmark] source_stamp=$SOURCE_STAMP"
+    REPO="$REPO" python3 - <<'PY' | tee "$SOURCE_STAMP"
 import hashlib
 import importlib.metadata as md
 import os
@@ -114,9 +136,15 @@ PY
         "${CMD[@]}" 2>&1 | tee "$log"
         echo "[benchmark] DONE run $i"
     done
+    sdpa_log="$CURRENT_DIR/sdpa_baseline.log"
+    echo "[benchmark] START sdpa baseline -> $sdpa_log"
+    "${SDPA_CMD[@]}" 2>&1 | tee "$sdpa_log"
+    echo "[benchmark] DONE sdpa baseline"
 )
 
 python3 "$SCRIPT_DIR/compare_benchmark.py" \
     --current "$CURRENT_DIR" \
     --previous "$PREVIOUS_DIR" \
+    --sdpa-baseline "$CURRENT_DIR/sdpa_baseline.log" \
+    --source-stamp "$SOURCE_STAMP" \
     --report "$CURRENT_DIR/benchmark_report.md"
