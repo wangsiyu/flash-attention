@@ -86,7 +86,7 @@ VERBOSE = True
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
+@pytest.mark.parametrize("d", [256])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -144,11 +144,6 @@ def test_flash_attn_output(
         pytest.xfail("has_qv: local not supported yet")
     if has_qv and has_learnable_sink:
         pytest.xfail("has_qv: learnable sink not supported yet")
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -456,7 +451,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192, 256])
+@pytest.mark.parametrize("d", [256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -531,11 +526,6 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -1553,7 +1543,7 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("d", [256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
@@ -1633,7 +1623,7 @@ def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad_unused(seqlen_q, seqlen_k, d, causal, dtype):

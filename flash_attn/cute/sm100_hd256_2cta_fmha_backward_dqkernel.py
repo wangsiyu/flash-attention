@@ -85,7 +85,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         assert self.head_dim_v_padded == 256
         assert self.m_block_size == 128 and self.n_block_size == 128, "Only 128x128 tile impl is supported"
         assert not is_persistent
-        assert not deterministic
         assert cluster_size == 2
         assert self.use_2cta_instrs
         assert mask_mod is None

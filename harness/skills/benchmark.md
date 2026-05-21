@@ -34,6 +34,18 @@ Performance gate for CuteDSL HD256 work.
 | B5 Decide | This round passes only if no systemic performance regression is detected. |
 | B6 Stress handoff | Return to `workflow.md` W4 and run `hd256_hang_stress.md` before W5/W6. |
 
+## Required Coverage
+
+| Area | Requirement |
+| ---- | ----------- |
+| Dense MHA | Include `headq:headk = 16:16` from seqlen `1k` through `32k`. |
+| Dense GQA | Include `headq:headk = 16:1` from seqlen `1k` through `32k`. |
+| Varlen GQA | Include only `headq:headk = 16:1`; for every total len from `1k` through `32k`, run replicated fixed-doc cases for doc len `128,256,512,...,total_len`. |
+| Varlen construction | Do not randomize document lengths; build `cu_seqlens` by repeating the requested fixed document length until the requested total length is reached. Generate doc lengths per total length by doubling from `128` through that total length. |
+| Report keys | Compare medians by suite, direction, mask, total/seqlen, and varlen doc length so GQA/MHA and dense/varlen cases cannot be merged. |
+| SDPA baseline | Run PyTorch SDPA once separately for the same logical workload and merge it into the report. Reports must include `SDPA TFLOPS`, `FA/SDPA`, and `Gap vs SDPA`; positive gap means FA is faster. |
+| Source stamp | Write git head, package versions, and key CuteDSL module path/SHA/mtime to `source_stamp.log`, then embed it in `benchmark_report.md` so run-to-run noise can be distinguished from code changes. |
+
 ## Regression Policy
 
 | Condition | Required Action |
