@@ -113,6 +113,12 @@ SEQLEN_CONFIGS = [
     (4224, 4224),
 ]
 
+HD256_SCORE_MOD_SEQLEN_CONFIGS = [
+    (64, 64),
+    (128, 256),
+    (113, 203),
+]
+
 VEC_SIZES_TO_CHECK_EQUALITY = [1, 2, 4] if COMPUTE_CAPABILITY == 10 else [1, 2]
 
 
@@ -146,6 +152,128 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     if dtype is not None:
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
     return flex_attention(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
+
+
+def _check_fwd_score_mod(q, k, v, cute_score_mod, eager_score_mod, dtype, aux_tensors=None):
+    out_ref_fp32 = run_flex_reference(q, k, v, eager_score_mod, dtype=torch.float32)
+    out_pt = run_flex_reference(q, k, v, eager_score_mod)
+    out_cute = run_cute_flash(q, k, v, cute_score_mod, aux_tensors=aux_tensors)
+
+    assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
+    assert not torch.isnan(out_cute).any()
+    assert not torch.isnan(out_ref_fp32).any()
+    assert not torch.isnan(out_pt).any()
+    assert torch.isfinite(out_cute).all()
+    assert torch.isfinite(out_ref_fp32).all()
+    assert torch.isfinite(out_pt).all()
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(f"\nHD256 numerical comparison for {cute_score_mod.__name__}:")
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+    print(f"  Dynamic absolute tolerance: {fwd_atol:.2e}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", HD256_SCORE_MOD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+def test_cute_vs_flex_attention_hd256(seqlen_q, seqlen_kv, dtype, score_mod_pair):
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod = score_mod_pair
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=256, dtype=dtype
+    )
+    _check_fwd_score_mod(q, k, v, cute_score_mod, eager_score_mod, dtype)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", HD256_SCORE_MOD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("score_mod_vec_pair", TEST_PAIRS_VECTORIZED)
+def test_cute_score_mod_vectorized_hd256(seqlen_q, seqlen_kv, dtype, score_mod_vec_pair):
+    torch.random.manual_seed(42)
+    cute_score_mod, cute_vectorized_score_mod = score_mod_vec_pair
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=256, dtype=dtype
+    )
+    out_ref = run_cute_flash(q, k, v, cute_score_mod)
+
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
+        cute_vectorized_score_mod.__vec_size__ = vec_size
+        out = run_cute_flash(q, k, v, cute_vectorized_score_mod)
+        assert torch.equal(out, out_ref)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", HD256_SCORE_MOD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
+def test_cute_vs_flex_attention_hd256_with_aux_tensors(
+    seqlen_q, seqlen_kv, dtype, score_mod_pair
+):
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod_factory = score_mod_pair
+    batch_size = 2
+    num_heads = 4
+    q, k, v = create_tensors(
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=num_heads,
+        dim=256,
+        dtype=dtype,
+    )
+    if cute_score_mod == score_mod_10:
+        buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
+        aux_tensors = [buffer]
+        eager_score_mod = eager_score_mod_factory(buffer)
+    elif cute_score_mod == score_mod_11:
+        head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+        pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_scale]
+        eager_score_mod = eager_score_mod_factory(head_bias, pos_scale)
+
+    _check_fwd_score_mod(q, k, v, cute_score_mod, eager_score_mod, dtype, aux_tensors)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", HD256_SCORE_MOD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("score_mod_vec_pair", TEST_PAIRS_WITH_AUX_TENSORS_VECTORIZED)
+def test_cute_score_mod_hd256_with_aux_tensors_vectorized(
+    seqlen_q, seqlen_kv, dtype, score_mod_vec_pair
+):
+    torch.random.manual_seed(42)
+    cute_score_mod, cute_vectorized_score_mod = score_mod_vec_pair
+    batch_size = 2
+    num_heads = 4
+    q, k, v = create_tensors(
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=num_heads,
+        dim=256,
+        dtype=dtype,
+    )
+    if cute_score_mod == score_mod_10:
+        buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
+        aux_tensors = [buffer]
+    elif cute_score_mod == score_mod_11:
+        head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+        pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_scale]
+
+    out_ref = run_cute_flash(q, k, v, cute_score_mod, aux_tensors=aux_tensors)
+
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
+        cute_vectorized_score_mod.__vec_size__ = vec_size
+        out = run_cute_flash(q, k, v, cute_vectorized_score_mod, aux_tensors=aux_tensors)
+        assert torch.equal(out, out_ref)
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
@@ -1062,6 +1190,75 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
     head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
     pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
     return [head_bias, pos_scale], eager_factory(head_bias, pos_scale)
+
+
+def _check_bwd_score_mod(q, k, v, cute_fwd, cute_bwd, eager_ref, dtype, aux_tensors=None):
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd, aux_tensors=aux_tensors, use_autograd=False
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, eager_ref, grad_out)
+
+    assert not torch.isnan(dq_cute).any()
+    assert not torch.isnan(dk_cute).any()
+    assert not torch.isnan(dv_cute).any()
+
+    rtol = 3 if aux_tensors is not None else 2
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nHD256 backward comparison for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", HD256_SCORE_MOD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
+def test_cute_vs_flex_attention_backward_hd256(seqlen_q, seqlen_kv, dtype, score_mod_triple):
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_ref = score_mod_triple
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=256, dtype=dtype
+    )
+    _check_bwd_score_mod(q, k, v, cute_fwd, cute_bwd, eager_ref, dtype)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", HD256_SCORE_MOD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
+def test_cute_vs_flex_attention_backward_hd256_with_aux(
+    seqlen_q, seqlen_kv, dtype, score_mod_triple
+):
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_factory = score_mod_triple
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=256, dtype=dtype
+    )
+    aux_tensors, eager_ref = make_aux_tensors_for_bwd(
+        cute_fwd, eager_factory, seqlen_q, q.shape[1], q.shape[0], dtype
+    )
+    _check_bwd_score_mod(q, k, v, cute_fwd, cute_bwd, eager_ref, dtype, aux_tensors)
 
 
 @pytest.mark.parametrize(

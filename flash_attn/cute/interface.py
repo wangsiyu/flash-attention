@@ -846,9 +846,6 @@ def _flash_attn_fwd(
             else:
                 if use_dedicated_hd256_kernel:
                     # hd=256 2CTA forward: check for currently unsupported features
-                    assert score_mod is None or softcap is not None, (
-                        "SM100 forward with head_dim=256 only supports softcap score_mod"
-                    )
                     assert not use_block_sparsity, \
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     if page_table is not None:
@@ -1330,7 +1327,9 @@ def _flash_attn_bwd(
         use_2cta_instrs = cluster_size==2
 
     use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
-    use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if use_dedicated_hd256_kernel:
+        cluster_size = 2
+        use_2cta_instrs = True
     dkv_n_block_size = 64 if use_dedicated_hd256_kernel else n_block_size
     dkv_postprocess_n_block_size = (
         cluster_size * dkv_n_block_size if use_dedicated_hd256_kernel else dkv_n_block_size
@@ -1429,9 +1428,6 @@ def _flash_attn_bwd(
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert cu_seqlens_q is None and cu_seqlens_k is None, (
-            "varlen + score_mod not supported in bwd yet"
-        )
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
@@ -1757,11 +1753,6 @@ def _flash_attn_bwd(
             )
         else:
             if use_dedicated_hd256_kernel:
-                assert (
-                    score_mod is None and score_mod_bwd is None
-                ) or softcap != 0.0, (
-                    "SM100 backward with head_dim=256 only supports softcap score_mod"
-                )
                 assert block_sparse_tensors is None, \
                     "SM100 backward with head_dim=256 does not support block sparsity"
                 dq_tile_mn = (128, 128)
