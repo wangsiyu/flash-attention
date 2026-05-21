@@ -67,6 +67,7 @@ patches it before running.
 | ----- | ----------- | --- |
 | HD256 output | `tests/cute/test_flash_attn.py::test_flash_attn_output` | `harness/logs/test/ut_hd256_output.log` |
 | HD256 varlen output | `tests/cute/test_flash_attn.py::test_flash_attn_varlen_output` | `harness/logs/test/ut_hd256_varlen_output.log` |
+| HD256 score_mod | HD256 score_mod subset in `tests/cute/test_score_mod.py` | `harness/logs/test/ut_hd256_score_mod.log` |
 | HD256 dLSE | `tests/cute/test_flash_attn.py::test_flash_attn_lse_grad` and `tests/cute/test_flash_attn.py::test_flash_attn_lse_grad_unused` | `harness/logs/test/ut_hd256_dlse.log` |
 | Varlen | `tests/cute/test_flash_attn_varlen.py::test_varlen` | `harness/logs/test/ut_varlen.log` |
 

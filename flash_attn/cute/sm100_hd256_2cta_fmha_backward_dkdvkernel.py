@@ -16,6 +16,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.utils import LayoutEnum
@@ -368,6 +369,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_right: Int32 | int | None = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        aux_tensors: Optional[list] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -702,6 +704,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
 
+        fastdiv_mods = None
+        if const_expr(aux_tensors is not None):
+            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_k = cute.size(mK.shape[0])
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+            assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
+                "Variable sequence length is not supported yet for aux tensors in bwd"
+            )
+
         self.kernel(
             tma_tensor_Q,
             tma_tensor_Qt,
@@ -751,6 +764,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             mdK_semaphore,
             mdV_semaphore,
             tile_sched_params,
+            aux_tensors,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -811,6 +826,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
         tile_sched_params,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ):
         """Core CuTeDSL backward kernel."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1236,6 +1253,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 mdK_semaphore,
                 sdV_layout,
                 sdK_layout,
+                aux_tensors,
+                fastdiv_mods,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1912,20 +1931,29 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         q_idx_vec = cute.make_rmem_tensor(self.vec_size, Int32)
         kv_idx_vec = cute.make_rmem_tensor(self.vec_size, Int32)
         batch_idx_ssa = utils.scalar_to_ssa(batch_idx, Int32).broadcast_to((self.vec_size,))
+        q_block_offset = m_block * self.tile_m
+        kv_block_offset = n_block * self.cta_group_size * self.tile_n
+        if const_expr(aux_tensors is not None and fastdiv_mods is not None):
+            seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
 
         for i in cutlass.range(0, n_vals, self.vec_size, unroll_full=True):
             for j in cutlass.range(self.vec_size, unroll_full=True):
                 score_vec[j] = tSrS_t2r[i + j] * softmax_scale
-                kv_idx_vec[j] = (
-                    tScS_t2r[i + j][0] + n_block * self.cta_group_size * self.tile_n
-                )
-                q_idx_vec[j] = tScS_t2r[i + j][1] + m_block * self.tile_m
+                kv_idx = tScS_t2r[i + j][0] + kv_block_offset
+                q_idx = tScS_t2r[i + j][1] + q_block_offset
+                if const_expr(aux_tensors is not None and fastdiv_mods is not None):
+                    _, q_idx = divmod(q_idx, seqlen_q_divmod)
+                    _, kv_idx = divmod(kv_idx, seqlen_k_divmod)
+                kv_idx_vec[j] = kv_idx
+                q_idx_vec[j] = q_idx
 
             score_ssa = score_vec.load()
             q_idx_ssa = q_idx_vec.load()
             kv_idx_ssa = kv_idx_vec.load()
             head_idx_ssa = utils.scalar_to_ssa(head_idx, Int32).broadcast_to((self.vec_size,))
             aux_args = []
+            if const_expr(aux_tensors is not None):
+                aux_args = aux_tensors
 
             post_mod_scores = self.score_mod(
                 score_ssa,
@@ -1963,15 +1991,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         q_idx_vec = cute.make_fragment(self.vec_size, Int32)
         kv_idx_vec = cute.make_fragment(self.vec_size, Int32)
         batch_idx_ssa = utils.scalar_to_ssa(batch_idx, Int32).broadcast_to((self.vec_size,))
+        q_block_offset = m_block * self.tile_m
+        kv_block_offset = n_block * self.cta_group_size * self.tile_n
+        if const_expr(aux_tensors is not None and fastdiv_mods is not None):
+            seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
 
         for i in cutlass.range(0, n_vals, self.vec_size, unroll_full=True):
             for j in cutlass.range(self.vec_size, unroll_full=True):
                 grad_vec[j] = grad_tensor[i + j]
                 score_vec[j] = score_tensor[i + j] * softmax_scale
-                kv_idx_vec[j] = (
-                    index_tensor[i + j][0] + n_block * self.cta_group_size * self.tile_n
-                )
-                q_idx_vec[j] = index_tensor[i + j][1] + m_block * self.tile_m
+                kv_idx = index_tensor[i + j][0] + kv_block_offset
+                q_idx = index_tensor[i + j][1] + q_block_offset
+                if const_expr(aux_tensors is not None and fastdiv_mods is not None):
+                    _, q_idx = divmod(q_idx, seqlen_q_divmod)
+                    _, kv_idx = divmod(kv_idx, seqlen_k_divmod)
+                kv_idx_vec[j] = kv_idx
+                q_idx_vec[j] = q_idx
 
             grad_ssa = grad_vec.load()
             score_ssa = score_vec.load()
@@ -1979,6 +2014,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             kv_idx_ssa = kv_idx_vec.load()
             head_idx_ssa = utils.scalar_to_ssa(head_idx, Int32).broadcast_to((self.vec_size,))
             aux_args = []
+            if const_expr(aux_tensors is not None):
+                aux_args = aux_tensors
 
             grad_out_ssa = self.score_mod_bwd(
                 grad_ssa,
@@ -2039,6 +2076,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         mdK_semaphore: Optional[cute.Tensor],
         sdV_layout: cute.ComposedLayout,
         sdK_layout: cute.ComposedLayout,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         sLSE_2D = cute.make_tensor(
@@ -2203,6 +2242,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         n_block_for_cluster,
                         softmax_scale,
                         seqlen,
+                        aux_tensors,
+                        fastdiv_mods,
                     )
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
@@ -2308,6 +2349,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         n_block_for_cluster,
                         softmax_scale,
                         seqlen,
+                        aux_tensors,
+                        fastdiv_mods,
                     )
                     for i in cutlass.range(cute.size(tdPrdP_t2r), unroll_full=True):
                         kv_idx = (

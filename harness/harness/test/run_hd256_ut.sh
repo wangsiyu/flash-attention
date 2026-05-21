@@ -8,6 +8,7 @@
 #   harness/logs/test/preflight.log
 #   harness/logs/test/ut_hd256_output.log
 #   harness/logs/test/ut_hd256_varlen_output.log
+#   harness/logs/test/ut_hd256_score_mod.log
 #   harness/logs/test/ut_hd256_dlse.log
 #   harness/logs/test/ut_varlen.log
 
@@ -18,6 +19,7 @@ HARNESS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPO="$(cd "$HARNESS_ROOT/.." && pwd)"
 LOGDIR="$HARNESS_ROOT/logs/test"
 TEST_FILE="$REPO/tests/cute/test_flash_attn.py"
+SCORE_MOD_TEST_FILE="$REPO/tests/cute/test_score_mod.py"
 VARLEN_TEST_FILE="$REPO/tests/cute/test_flash_attn_varlen.py"
 PREFLIGHT_ONLY=0
 PYTEST_IMPORT_ARGS=(--import-mode=importlib --rootdir="$REPO")
@@ -114,6 +116,7 @@ targets = [
 ]
 for label, path in [
     ("test_flash_attn", targets[0][0]),
+    ("test_score_mod", repo / "tests/cute/test_score_mod.py"),
     ("test_flash_attn_varlen", targets[2][0]),
 ]:
     stamp(label, path)
@@ -181,7 +184,7 @@ run_test_group() {
     local logfile="$2"
     shift 2
     echo "[$(date '+%H:%M:%S')] START  $name -> $logfile"
-    if cd /tmp && python3 -m pytest -v -s "${PYTEST_IMPORT_ARGS[@]}" "${PYTEST_XDIST_ARGS[@]}" --tb=long "$@" > "$logfile" 2>&1; then
+    if cd /tmp && PYTHONPATH="$REPO/tests/cute:${PYTHONPATH:-}" python3 -m pytest -v -s "${PYTEST_IMPORT_ARGS[@]}" "${PYTEST_XDIST_ARGS[@]}" --tb=long "$@" > "$logfile" 2>&1; then
         results+=("PASS  $name")
         ((pass++))
     else
@@ -196,6 +199,14 @@ run_test_group "hd256 output" "$LOGDIR/ut_hd256_output.log" \
 
 run_test_group "hd256 varlen output" "$LOGDIR/ut_hd256_varlen_output.log" \
     "$TEST_FILE::test_flash_attn_varlen_output"
+
+run_test_group "hd256 score_mod" "$LOGDIR/ut_hd256_score_mod.log" \
+    "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_hd256" \
+    "$SCORE_MOD_TEST_FILE::test_cute_score_mod_vectorized_hd256" \
+    "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_hd256_with_aux_tensors" \
+    "$SCORE_MOD_TEST_FILE::test_cute_score_mod_hd256_with_aux_tensors_vectorized" \
+    "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_backward_hd256" \
+    "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_backward_hd256_with_aux"
 
 run_test_group "hd256 dlse" "$LOGDIR/ut_hd256_dlse.log" \
     "$TEST_FILE::test_flash_attn_lse_grad" \

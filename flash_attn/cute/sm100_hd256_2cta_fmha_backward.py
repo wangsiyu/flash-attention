@@ -135,7 +135,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
         )
         assert mask_mod is None, "SM100 backward with head_dim=256 does not support mask_mod"
-        assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
         assert cluster_size in (1, 2), (
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
         )
@@ -220,7 +219,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
-        aux_tensors: tuple[cute.Tensor] | None = None,
+        aux_tensors: list | None = None,
         block_sparse_tensors: cute.Tensor | None = None,
         stream: cuda.CUstream = None,
     ):
@@ -228,9 +227,10 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert block_sparse_tensors is None, (
             "SM100 backward with head_dim=256 does not support block sparse tensors"
         )
-        assert aux_tensors is None or len(aux_tensors) == 0, (
-            "SM100 backward with head_dim=256 does not support aux_tensors"
-        )
+        if cutlass.const_expr(aux_tensors is not None):
+            assert all(
+                x is None for x in (cumulative_s_q, cumulative_s_k, seqused_q, seqused_k)
+            ), "Variable sequence length is not supported yet for aux tensors in bwd"
         assert dQ_accum is not None, (
             "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
         )
@@ -291,6 +291,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             mdQ_semaphore=None,
             mdK_semaphore=None,
             mdV_semaphore=None,
+            aux_tensors=aux_tensors,
             stream=stream,
         )
         self.dkdv_kernel(
@@ -311,5 +312,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             window_size_right=window_size_right,
             mdK_semaphore=dK_semaphore,
             mdV_semaphore=dV_semaphore,
+            aux_tensors=aux_tensors,
             stream=stream,
         )

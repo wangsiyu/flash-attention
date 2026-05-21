@@ -8,9 +8,9 @@
 # - varlen
 # - sliding window
 # - learnable sink
-# - softcap
+# - softcap / custom score_mod
 # Unsupported features that will be added later:
-# - custom score_mod / mask_mod
+# - mask_mod
 # - paged KV
 # - split-kv
 
@@ -26,6 +26,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as pipeline
 import flash_attn.cute.pipeline as pipeline_custom
 from cutlass import const_expr, Boolean
+from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -87,7 +88,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         assert head_dim % hdim_multiple_of == 0 and head_dim_v % hdim_multiple_of == 0
         assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
-        assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
         assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
@@ -222,7 +222,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert blocksparse_tensors is None, (
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
-        assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
@@ -451,6 +450,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable
         )
         head_divmod = None
+        if cutlass.const_expr(self.pack_gqa):
+            head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         grid_dim = cute.round_up(grid_dim, self.cluster_shape_mnk)
         # Launch the kernel synchronously
@@ -1463,6 +1464,25 @@ class BlackwellFusedMultiHeadAttentionForward:
                 aux_tensors=aux_tensors,
             )
 
+            # Recompute fastdiv_mods if necessary
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+            )
+
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
+
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
@@ -1886,6 +1906,18 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Shared q_idx for all scores
         q_idx_logical = tScS_t2r[0][0]
+
+        # For Pack-GQA, compute the logical head index for this tile
+        if cutlass.const_expr(self.pack_gqa):
+            assert head_divmod is not None
+            # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
+            q_physical = q_idx_logical
+            q_idx_logical, head_offset = divmod(q_physical, head_divmod)
+            head_idx = head_idx * self.qhead_per_kvhead + head_offset
+
+        if cutlass.const_expr(aux_tensors is not None):
+            seqlen_q_divmod, _ = fastdiv_mods
+            _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
         apply_score_mod_inner(
             tSrS_t2r,
