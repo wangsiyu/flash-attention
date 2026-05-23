@@ -9,9 +9,9 @@ LOG_ROOT="$HARNESS_CODE_ROOT/logs/benchmark"
 CURRENT_DIR="$LOG_ROOT/current"
 PREVIOUS_DIR="$LOG_ROOT/previous"
 SOURCE_STAMP="$CURRENT_DIR/source_stamp.log"
-RUNS="${BENCHMARK_RUNS:-3}"
-REP="${BENCHMARK_REP:-50}"
-WARMUP="${BENCHMARK_WARMUP:-10}"
+RUNS="${BENCHMARK_RUNS:-1}"
+REP="${BENCHMARK_REP:-1000}"
+WARMUP="${BENCHMARK_WARMUP:-100}"
 SDPA_REP="${BENCHMARK_SDPA_REP:-$REP}"
 SDPA_WARMUP="${BENCHMARK_SDPA_WARMUP:-$WARMUP}"
 DRY_RUN=0
@@ -52,6 +52,18 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
 fi
 
+keepalive_load_running() {
+    ps -eo args= | awk '
+        /keepalive_idle_load\.py/ && !/awk / { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+while keepalive_load_running; do
+    echo "[benchmark] waiting for keepalive CPU load to finish"
+    sleep 5
+done
+
 if [[ -d "$CURRENT_DIR" ]]; then
     if [[ -f "$CURRENT_DIR/benchmark_report.md" ]]; then
         rm -rf "$PREVIOUS_DIR"
@@ -76,6 +88,10 @@ from pathlib import Path
 import flash_attn.cute.interface as interface
 import flash_attn.cute.pipeline as pipeline
 import flash_attn.cute.flash_fwd as flash_fwd
+import flash_attn.cute.block_info as block_info
+import flash_attn.cute.block_sparse_utils as block_sparse_utils
+import flash_attn.cute.mask as mask
+import flash_attn.cute.sm100_hd256_2cta_fmha_forward as fwd
 import flash_attn.cute.sm100_hd256_2cta_fmha_backward as bwd
 import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel as dkdv
 import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel as dq
@@ -124,6 +140,10 @@ for label, module in [
     ("interface", interface),
     ("pipeline", pipeline),
     ("flash_fwd", flash_fwd),
+    ("block_info", block_info),
+    ("block_sparse_utils", block_sparse_utils),
+    ("mask", mask),
+    ("sm100_hd256_fwd", fwd),
     ("sm100_hd256_bwd", bwd),
     ("sm100_hd256_dkdv", dkdv),
     ("sm100_hd256_dq", dq),

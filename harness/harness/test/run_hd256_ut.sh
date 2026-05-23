@@ -3,29 +3,84 @@
 # Usage:
 #   bash harness/harness/test/run_hd256_ut.sh
 #   bash harness/harness/test/run_hd256_ut.sh --preflight-only
+#   bash harness/harness/test/run_hd256_ut.sh --start-at hd256_varlen_output
 #
 # Logs:
 #   harness/logs/test/preflight.log
 #   harness/logs/test/ut_hd256_output.log
 #   harness/logs/test/ut_hd256_varlen_output.log
 #   harness/logs/test/ut_hd256_score_mod.log
+#   harness/logs/test/ut_hd256_mask_mod_block_sparse.log
 #   harness/logs/test/ut_hd256_dlse.log
 #   harness/logs/test/ut_varlen.log
 
 set -u
 
+export LD_LIBRARY_PATH="/opt/hpcx/ucx/lib:/opt/hpcx/ucc/lib:${LD_LIBRARY_PATH:-}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPO="$(cd "$HARNESS_ROOT/.." && pwd)"
-LOGDIR="$HARNESS_ROOT/logs/test"
+LOGDIR="${HD256_UT_LOGDIR:-$HARNESS_ROOT/logs/test}"
 TEST_FILE="$REPO/tests/cute/test_flash_attn.py"
 SCORE_MOD_TEST_FILE="$REPO/tests/cute/test_score_mod.py"
+MASK_MOD_TEST_FILE="$REPO/tests/cute/test_mask_mod.py"
 VARLEN_TEST_FILE="$REPO/tests/cute/test_flash_attn_varlen.py"
 PREFLIGHT_ONLY=0
+START_AT="${HD256_UT_START_AT:-hd256_output}"
 PYTEST_IMPORT_ARGS=(--import-mode=importlib --rootdir="$REPO")
 
-if [[ "${1:-}" == "--preflight-only" ]]; then
-    PREFLIGHT_ONLY=1
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --preflight-only)
+            PREFLIGHT_ONLY=1
+            shift
+            ;;
+        --start-at)
+            if [[ $# -lt 2 ]]; then
+                echo "--start-at requires a group name" >&2
+                exit 2
+            fi
+            START_AT="$2"
+            shift 2
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+normalize_group() {
+    case "$1" in
+        hd256_output|output)
+            echo "hd256_output"
+            ;;
+        hd256_varlen_output|varlen_output)
+            echo "hd256_varlen_output"
+            ;;
+        hd256_score_mod|score_mod)
+            echo "hd256_score_mod"
+            ;;
+        hd256_mask_mod_block_sparse|mask_mod_block_sparse|mask_mod)
+            echo "hd256_mask_mod_block_sparse"
+            ;;
+        hd256_dlse|dlse)
+            echo "hd256_dlse"
+            ;;
+        varlen)
+            echo "varlen"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+START_AT="$(normalize_group "$START_AT")"
+if [[ -z "$START_AT" ]]; then
+    echo "unknown --start-at group. Expected one of: hd256_output, hd256_varlen_output, hd256_score_mod, hd256_mask_mod_block_sparse, hd256_dlse, varlen" >&2
+    exit 2
 fi
 
 mkdir -p "$LOGDIR"
@@ -174,17 +229,48 @@ PYTEST_XDIST_ARGS=()
 if cd /tmp && python3 -m pytest --help 2>/dev/null | grep -q -- "--numprocesses"; then
     PYTEST_XDIST_ARGS=(-n 0)
 fi
+PYTEST_DURATION_ARGS=(--durations=0 --durations-min=45.0)
 
 pass=0
 fail=0
 results=()
+GROUP_ORDER=(
+    hd256_output
+    hd256_varlen_output
+    hd256_score_mod
+    hd256_mask_mod_block_sparse
+    hd256_dlse
+    varlen
+)
+
+group_index() {
+    local key="$1"
+    local i
+    for i in "${!GROUP_ORDER[@]}"; do
+        if [[ "${GROUP_ORDER[$i]}" == "$key" ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+START_INDEX="$(group_index "$START_AT")"
 
 run_test_group() {
-    local name="$1"
-    local logfile="$2"
-    shift 2
+    local key="$1"
+    local name="$2"
+    local logfile="$3"
+    shift 3
+    local index
+    index="$(group_index "$key")"
+    if (( index < START_INDEX )); then
+        echo "[$(date '+%H:%M:%S')] SKIP   $name  (--start-at $START_AT)"
+        results+=("SKIP  $name")
+        return 0
+    fi
     echo "[$(date '+%H:%M:%S')] START  $name -> $logfile"
-    if cd /tmp && PYTHONPATH="$REPO/tests/cute:${PYTHONPATH:-}" python3 -m pytest -v -s "${PYTEST_IMPORT_ARGS[@]}" "${PYTEST_XDIST_ARGS[@]}" --tb=long "$@" > "$logfile" 2>&1; then
+    if cd /tmp && PYTHONPATH="$REPO/tests/cute:${PYTHONPATH:-}" python3 -m pytest -v -s "${PYTEST_IMPORT_ARGS[@]}" "${PYTEST_XDIST_ARGS[@]}" "${PYTEST_DURATION_ARGS[@]}" --tb=long "$@" > "$logfile" 2>&1; then
         results+=("PASS  $name")
         ((pass++))
     else
@@ -194,13 +280,13 @@ run_test_group() {
     echo "[$(date '+%H:%M:%S')] DONE   $name  ($(tail -1 "$logfile"))"
 }
 
-run_test_group "hd256 output" "$LOGDIR/ut_hd256_output.log" \
+run_test_group "hd256_output" "hd256 output" "$LOGDIR/ut_hd256_output.log" \
     "$TEST_FILE::test_flash_attn_output"
 
-run_test_group "hd256 varlen output" "$LOGDIR/ut_hd256_varlen_output.log" \
+run_test_group "hd256_varlen_output" "hd256 varlen output" "$LOGDIR/ut_hd256_varlen_output.log" \
     "$TEST_FILE::test_flash_attn_varlen_output"
 
-run_test_group "hd256 score_mod" "$LOGDIR/ut_hd256_score_mod.log" \
+run_test_group "hd256_score_mod" "hd256 score_mod" "$LOGDIR/ut_hd256_score_mod.log" \
     "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_hd256" \
     "$SCORE_MOD_TEST_FILE::test_cute_score_mod_vectorized_hd256" \
     "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_hd256_with_aux_tensors" \
@@ -208,11 +294,17 @@ run_test_group "hd256 score_mod" "$LOGDIR/ut_hd256_score_mod.log" \
     "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_backward_hd256" \
     "$SCORE_MOD_TEST_FILE::test_cute_vs_flex_attention_backward_hd256_with_aux"
 
-run_test_group "hd256 dlse" "$LOGDIR/ut_hd256_dlse.log" \
+run_test_group "hd256_mask_mod_block_sparse" "hd256 mask_mod block_sparse" "$LOGDIR/ut_hd256_mask_mod_block_sparse.log" \
+    "$MASK_MOD_TEST_FILE::test_sm100_hd256_dense_mask_mod_autograd" \
+    "$MASK_MOD_TEST_FILE::test_sm100_block_sparse_sink_all_masked" \
+    "$MASK_MOD_TEST_FILE::test_sm100_block_sparse_coarse_blocks" \
+    "$MASK_MOD_TEST_FILE::test_sm100_block_sparse_coarse_blocks_mismatch"
+
+run_test_group "hd256_dlse" "hd256 dlse" "$LOGDIR/ut_hd256_dlse.log" \
     "$TEST_FILE::test_flash_attn_lse_grad" \
     "$TEST_FILE::test_flash_attn_lse_grad_unused"
 
-run_test_group "varlen" "$LOGDIR/ut_varlen.log" \
+run_test_group "varlen" "varlen" "$LOGDIR/ut_varlen.log" \
     "$VARLEN_TEST_FILE::test_varlen"
 
 echo ""
