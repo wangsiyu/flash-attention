@@ -87,7 +87,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             "SM100 HD256 dK/dV kernel only supports tile_m=128 and tile_n=64"
         )
 
-        self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2 and mask_mod is None)
+        self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
         assert self.use_2cta_instrs, "SM100 HD256 dK/dV kernel requires use_2cta_instrs=True"
@@ -2205,11 +2205,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                mask_mod=None,
+                mask_mod=self.mask_mod,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                aux_tensors=None,
-                fastdiv_mods=(None, None),
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
             )
             process_tile = (
                 cutlass.const_expr(not self.is_local and not self.is_varlen_q)

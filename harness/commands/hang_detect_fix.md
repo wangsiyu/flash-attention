@@ -8,7 +8,7 @@ logs: ../logs/hang_detect_fix/
 
 # Hang Detect Fix
 
-Helper command for cuda-gdb diagnostics after reproducing a hang.
+Helper command for cuda-gdb diagnostics on a live suspected hang.
 
 ## Invocation
 
@@ -21,8 +21,13 @@ Helper command for cuda-gdb diagnostics after reproducing a hang.
 
 | Step | Action |
 | ---- | ------ |
-| 1 | Let `/test` kill the broad UT run after hang detection. |
-| 2 | Reproduce the smallest hanging case manually. |
-| 3 | Find the reproduced process PID. |
-| 4 | Run this command to collect cuda-gdb diagnostics. |
-| 5 | Fix the hang point, then rerun `/test`. |
+| 1 | Keep the broad UT process alive when a hang is suspected. |
+| 2 | Find the live pytest PID from the existing UT process group. |
+| 3 | Run this command to collect cuda-gdb diagnostics on that live PID. |
+| 4 | Use the snapshot to classify compile/setup slowness vs kernel hang. |
+| 5 | If it is compile/setup slowness, keep waiting and re-sample. If it is a kernel hang, analyze the captured kernel/warp/disassembly state against the source. |
+| 6 | If a source/kernel fix is made, rerun the full gate from the beginning. If no code changed and the process had to be stopped, rerun only the affected group. |
+
+Do not restart with a smaller reproduction before capturing live diagnostics.
+Do not kill the broad UT process merely because a slow case was observed.
+Clear stale hang/debug logs before each monitored run.

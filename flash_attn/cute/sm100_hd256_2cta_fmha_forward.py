@@ -9,8 +9,9 @@
 # - sliding window
 # - learnable sink
 # - softcap / custom score_mod
-# Unsupported features that will be added later:
 # - mask_mod
+# - block sparsity
+# Unsupported features that will be added later:
 # - paged KV
 # - split-kv
 
@@ -46,6 +47,11 @@ from flash_attn.cute.tile_scheduler import (
 )
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparse_utils import (
+    get_total_block_count,
+    produce_block_sparse_loads_sm100_qk_ahead,
+    softmax_block_sparse_sm100,
+)
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute import mma_sm100_desc as sm100_desc
@@ -87,14 +93,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 dedicated kernel only supports (head_dim, head_dim_v) = (256, 256)"
         )
         assert head_dim % hdim_multiple_of == 0 and head_dim_v % hdim_multiple_of == 0
-        assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
         assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
         assert not use_clc_scheduler, "SM100 forward with head_dim=256 does not support CLC scheduler"
-        assert q_subtile_factor is None, (
-            "SM100 forward with head_dim=256 does not support q_subtile_factor"
-        )
         assert m_block_size == 128 and n_block_size == 128, (
             "SM100 dedicated kernel only supports tile_m=128 and tile_n=128"
         )
@@ -138,6 +140,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_varlen_q = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        self.use_correction_warps_for_epi = is_varlen_q
         self.pack_gqa = pack_gqa
         self.q_subtile_factor = q_subtile_factor
         self.score_mod = score_mod
@@ -158,7 +161,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.correction_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 8
         self.load_warp_ids = (9,)
-        self.empty_warp_ids = (10, 11)
+        self.epilogue_warp_ids = (10,)
+        self.empty_warp_ids = (11,)
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
         self.threads_per_warp = cute.arch.WARP_SIZE
@@ -168,9 +172,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                 *self.correction_warp_ids,
                 self.mma_warp_id,
                 *self.load_warp_ids,
+                *self.epilogue_warp_ids,
                 *self.empty_warp_ids,
             )
         )
+        if self.use_correction_warps_for_epi:
+            self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
+            self.epilogue_warp_ids = self.correction_warp_ids
 
         self.tmem_s_offset = 0
         self.tmem_o_offset = 256
@@ -219,9 +227,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         stream: cuda.CUstream = None,
     ):
         assert mPageTable is None, "SM100 forward with head_dim=256 does not support paged KV"
-        assert blocksparse_tensors is None, (
-            "SM100 forward with head_dim=256 does not support block sparsity"
-        )
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
@@ -291,7 +296,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_qk.thr_id.shape,)
         )
 
-        self.epi_tile = self.block_tiler_pv[:2]
+        self.epi_tile = (self.m_block_size, self.head_dim_v_padded)
 
         sQ_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_qk,
@@ -320,6 +325,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.v_dtype,
             self.kv_stage,
         )
+        sO_layout = sm100_utils_basic.make_smem_layout_epi(
+            self.o_dtype,
+            self.o_layout,
+            self.epi_tile,
+            self.o_stage,
+        )
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
@@ -339,6 +350,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.tma_copy_bytes[name] *= self.cta_group_size
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
         # TMA load for Q
         tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
@@ -368,6 +380,36 @@ class BlackwellFusedMultiHeadAttentionForward:
             tiled_mma_pv,
             cta_layout_vmnk.shape,
         )
+
+        self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        self.use_tma_O = mCuSeqlensQ is None and mSeqUsedQ is None
+        if const_expr(self.use_tma_O):
+            tma_atom_O, mO = cpasync.make_tiled_tma_atom(
+                tma_store_op,
+                mO,
+                cute.select(sO_layout, mode=[0, 1]),
+                self.epi_tile,
+            )
+            gmem_tiled_copy_O = None
+        else:
+            tma_atom_O = None
+            universal_copy_bits = 128
+            async_copy_elems = universal_copy_bits // self.o_dtype.width
+            atom_universal_copy = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.o_dtype,
+                num_bits_per_copy=universal_copy_bits,
+            )
+            tO_shape_dim_1 = sO_layout.outer.shape[1][0] // async_copy_elems
+            tO_layout = cute.make_ordered_layout(
+                (self.num_epilogue_threads // tO_shape_dim_1, tO_shape_dim_1),
+                order=(1, 0),
+            )
+            assert self.m_block_size % tO_layout.shape[0] == 0
+            vO_layout = cute.make_layout((1, async_copy_elems))
+            gmem_tiled_copy_O = cute.make_tiled_copy_tv(
+                atom_universal_copy, tO_layout, vO_layout
+            )
 
         TileScheduler = self.TileScheduler
         _num_block_divisor = self.cta_tiler[0] * (
@@ -405,6 +447,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
+        sO_size = 0
+        sQ_size = cutlass.max(
+            cute.cosize(sQ_layout),
+            cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width,
+        )
+
         @cute.struct
         class SharedStorage:
             # m_barriers for pipelines
@@ -414,6 +462,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             mbar_P_full_lastsplit: cute.struct.MemRange[Int64, self.s_stage * 2]
             mbar_O_full: cute.struct.MemRange[Int64, self.o_stage * 2]
             mbar_softmax_stats: cute.struct.MemRange[Int64, self.s_stage * 2]
+            mbar_O_epi: cute.struct.MemRange[Int64, self.o_stage * 2]
             # Tmem dealloc cluster barrier
             tmem_dealloc_mbar_ptr: Int64
             # Tmem holding buffer
@@ -424,8 +473,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 self.qk_acc_dtype,
                 len(self.softmax_warp_ids) * self.threads_per_warp * 3,
             ]
+            sO: cute.struct.Align[
+                cute.struct.MemRange[self.o_dtype, sO_size],
+                self.buffer_align_bytes,
+            ]
             sQ: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(sQ_layout)],
+                cute.struct.MemRange[self.q_dtype, sQ_size],
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
@@ -439,10 +492,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.shared_storage = SharedStorage
 
-        tma_atom_O = None
-        sO_layout = None
         gmem_tiled_copy_Q = None
-        gmem_tiled_copy_O = None
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
@@ -452,6 +502,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
             head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
+
+        self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        if cutlass.const_expr(self.use_block_sparsity and self.is_varlen_q):
+            assert const_expr(blocksparse_tensors.cu_total_m_blocks is not None), (
+                "blocksparse_tensors.cu_total_m_blocks must be provided for varlen blocksparsity"
+            )
 
         grid_dim = cute.round_up(grid_dim, self.cluster_shape_mnk)
         # Launch the kernel synchronously
@@ -598,6 +654,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         correction_threads = ThreadCooperativeGroup(
             cute.arch.WARP_SIZE * len(self.correction_warp_ids)
         )
+        epilogue_threads = ThreadCooperativeGroup(
+            cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        )
         # For UMMA-bridging pipelines: the non-MMA side spans both CTAs in the cluster,
         # so the thread count must include warps from both CTAs.
         softmax_threads_cluster = ThreadCooperativeGroup(
@@ -666,17 +725,30 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0),
             num_threads=cute.arch.WARP_SIZE * 2,
         )
+        pipeline_o_epi = None
+        if const_expr(not self.use_correction_warps_for_epi):
+            pipeline_o_epi = pipeline_custom.PipelineAsync.create(
+                barrier_storage=storage.mbar_O_epi.data_ptr(),
+                num_stages=self.o_stage,
+                producer_group=correction_threads,
+                consumer_group=epilogue_threads,
+                defer_sync=True,
+            )
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
-        # Generate smem tensor Q/K/V.
+        # Generate smem tensor Q/K/V/O.
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        sO = cute.make_tensor(
+            cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype),
+            sO_layout.outer,
+        )
         sScale = storage.sScale.get_tensor(
             cute.make_layout(len(self.softmax_warp_ids) * self.threads_per_warp * 3)
         )
@@ -783,6 +855,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
+                blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
             )
 
@@ -812,12 +885,32 @@ class BlackwellFusedMultiHeadAttentionForward:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
+                blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Epilogue
+        # ///////////////////////////////////////////////////////////////////////////////
+        if const_expr(not self.use_correction_warps_for_epi):
+            if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
+                self.epilogue_s2g(
+                    mO,
+                    sO,
+                    gmem_tiled_copy_O,
+                    tma_atom_O,
+                    pipeline_o_epi,
+                    block_info,
+                    num_splits,
+                    SeqlenInfoCls,
+                    mma_tile_coord_v,
+                    tile_scheduler=tile_scheduler,
+                )
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
@@ -873,14 +966,18 @@ class BlackwellFusedMultiHeadAttentionForward:
                 sScale,
                 mO,
                 mLSE,
+                sO,
+                gmem_tiled_copy_O,
                 pipeline_o_acc,
                 pipeline_sm_stats,
                 sm_stats_barrier,
+                pipeline_o_epi,
                 learnable_sink,
                 softmax_scale_log2,
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
+                blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
@@ -908,32 +1005,54 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage),
         )
 
+    @cute.jit
     def load_KV(
         self,
         tma_atom: cute.CopyAtom,
         tXgX: cute.Tensor,
         tXsX: cute.Tensor,
         block: Int32,
-        hdim_stage: Int32,
         K_or_V: Literal["K", "V"],
         pipeline_kv: pipeline.PipelineAsync,
         producer_state: pipeline.PipelineState,
+        hdim_stage: Optional[Int32] = None,
+        hdim_stage_count: cutlass.Constexpr[int] = 1,
+        page_idx=None,
     ):
         assert K_or_V in ("K", "V")
-        stage = producer_state.index
-        pipeline_kv.producer_acquire(producer_state)
-        tXgX_cur = (
-            tXgX[None, block, hdim_stage]
-            if const_expr(K_or_V == "K")
-            else tXgX[None, hdim_stage, block]
-        )
-        tXsX_cur = tXsX[None, stage]
-        cute.copy(
-            tma_atom,
-            tXgX_cur,
-            tXsX_cur,
-            tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state),
-        )
+        if const_expr(hdim_stage is None):
+            for iter in cutlass.range_constexpr(hdim_stage_count):
+                stage = producer_state.index
+                pipeline_kv.producer_acquire(producer_state)
+                tXgX_cur = (
+                    tXgX[None, block, iter]
+                    if const_expr(K_or_V == "K")
+                    else tXgX[None, iter, block]
+                )
+                tXsX_cur = tXsX[None, stage]
+                cute.copy(
+                    tma_atom,
+                    tXgX_cur,
+                    tXsX_cur,
+                    tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state),
+                )
+                if const_expr(iter < hdim_stage_count - 1):
+                    producer_state.advance()
+        else:
+            stage = producer_state.index
+            pipeline_kv.producer_acquire(producer_state)
+            tXgX_cur = (
+                tXgX[None, block, hdim_stage]
+                if const_expr(K_or_V == "K")
+                else tXgX[None, hdim_stage, block]
+            )
+            tXsX_cur = tXsX[None, stage]
+            cute.copy(
+                tma_atom,
+                tXgX_cur,
+                tXsX_cur,
+                tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state),
+            )
 
     @cute.jit
     def load(
@@ -954,6 +1073,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
+        blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler: TileSchedulerProtocol,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1055,6 +1175,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tKsK,
                 K_or_V="K",
                 pipeline_kv=pipeline_kv,
+                hdim_stage_count=self.qk_hdim_stage,
             )
             load_V = partial(
                 self.load_KV,
@@ -1063,57 +1184,57 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tVsV,
                 K_or_V="V",
                 pipeline_kv=pipeline_kv,
+                hdim_stage_count=self.pv_hdim_stage,
             )
 
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
-            if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
-                # Q tile, split across the head-dim stages.
-                if issue_q_for_this_warp:
-                    for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
-                        load_Q(block=iter, stage=iter)
-                q_producer_phase ^= 1
-
-                # First logical KV block: n_block_max - 1.
-                kv_coord = n_block_max - 1
-                if issue_kv_for_this_warp:
-                    for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
-                        load_K(
-                            block=kv_coord,
-                            hdim_stage=iter,
-                            producer_state=kv_producer_state,
-                        )
-                        kv_producer_state.advance()
-
-                for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                    n_block = n_block_max - 2 - i
-                    # QK-ahead issue order: load next K before the previous V.
-                    if issue_kv_for_this_warp:
+            if const_expr(not self.use_block_sparsity):
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, m_block, split_idx, num_splits
+                )
+                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+                    # Q tile, split across the head-dim stages.
+                    if issue_q_for_this_warp:
                         for iter in cutlass.range(self.qk_hdim_stage, unroll=1):
-                            load_K(
-                                block=n_block,
-                                hdim_stage=iter,
-                                producer_state=kv_producer_state,
-                            )
-                            kv_producer_state.advance()
-                        # V for the previously produced score tile.
-                        for iter in cutlass.range(self.pv_hdim_stage, unroll=1):
-                            load_V(
-                                block=n_block + 1,
-                                hdim_stage=iter,
-                                producer_state=kv_producer_state,
-                            )
-                            kv_producer_state.advance()
-                # Final V tile for n_block_min.
-                if issue_kv_for_this_warp:
-                    for iter in cutlass.range(self.pv_hdim_stage, unroll=1):
-                        load_V(
-                            block=n_block_min,
-                            hdim_stage=iter,
-                            producer_state=kv_producer_state,
-                        )
+                            load_Q(block=iter, stage=iter)
+                    q_producer_phase ^= 1
+
+                    # First logical KV block: n_block_max - 1.
+                    kv_coord = n_block_max - 1
+                    if issue_kv_for_this_warp:
+                        load_K(block=kv_coord, producer_state=kv_producer_state)
                         kv_producer_state.advance()
+
+                    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                        n_block = n_block_max - 2 - i
+                        # QK-ahead issue order: load next K before the previous V.
+                        if issue_kv_for_this_warp:
+                            load_K(block=n_block, producer_state=kv_producer_state)
+                            kv_producer_state.advance()
+                            # V for the previously produced score tile.
+                            load_V(block=n_block + 1, producer_state=kv_producer_state)
+                            kv_producer_state.advance()
+                    # Final V tile for n_block_min.
+                    if issue_kv_for_this_warp:
+                        load_V(block=n_block_min, producer_state=kv_producer_state)
+                        kv_producer_state.advance()
+            else:
+                if issue_kv_for_this_warp or issue_q_for_this_warp:
+                    kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100_qk_ahead(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        kv_producer_state,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        pipeline_kv,
+                        self.q_load_stage,
+                        q_producer_phase,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
 
             work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
@@ -1144,6 +1265,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
+        blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
     ):
         bidx, _, _ = cute.arch.block_idx()
@@ -1229,11 +1351,23 @@ class BlackwellFusedMultiHeadAttentionForward:
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
             )
-            block_iter_count = n_block_max - n_block_min
-            if const_expr(not self.is_split_kv):
-                process_tile = True
+            if const_expr(self.use_block_sparsity):
+                block_iter_count = get_total_block_count(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
+                )
+                process_tile = block_iter_count > Int32(0)
             else:
-                process_tile = n_block_min < n_block_max
+                block_iter_count = n_block_max - n_block_min
+                if const_expr(not self.is_split_kv):
+                    process_tile = True
+                else:
+                    process_tile = n_block_min < n_block_max
 
             if process_tile:
                 O_should_accumulate = False
@@ -1405,6 +1539,39 @@ class BlackwellFusedMultiHeadAttentionForward:
         # End of persistent scheduler loop
 
     @cute.jit
+    def softmax_step_block_sparse(
+        self,
+        mma_si_consumer_phase: Int32,
+        sm_stats_producer_phase: Int32,
+        softmax_step_state: Int32,
+        n_block: Int32,
+        softmax_step: Callable,
+        mask_fn: Optional[Callable] = None,
+        is_first: bool = False,
+    ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
+        p_lastsplit_producer_phase = softmax_step_state % Int32(2)
+        stage = softmax_step_state // Int32(2)
+        (
+            mma_si_consumer_phase,
+            sm_stats_producer_phase,
+            p_lastsplit_producer_phase,
+        ) = softmax_step(
+            mma_si_consumer_phase,
+            sm_stats_producer_phase,
+            p_lastsplit_producer_phase,
+            n_block,
+            mask_fn=mask_fn,
+            is_first=is_first,
+            stage=stage,
+        )
+        stage ^= 1
+        return (
+            mma_si_consumer_phase,
+            sm_stats_producer_phase,
+            p_lastsplit_producer_phase + stage * Int32(2),
+        )
+
+    @cute.jit
     def softmax_loop(
         self,
         stage: int | Int32,
@@ -1491,6 +1658,17 @@ class BlackwellFusedMultiHeadAttentionForward:
                 head_divmod=head_divmod,
                 **shared_mask_kwargs,
             )
+            if const_expr(self.use_block_sparsity):
+                # Full blocks don't need mask_mod.
+                mask_fn_none = partial(
+                    mask.apply_mask_sm100,
+                    mask_mod=None,
+                    fastdiv_mods=fastdiv_mods,
+                    head_divmod=head_divmod,
+                    **shared_mask_kwargs,
+                )
+            else:
+                mask_fn_none = None
 
             max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
@@ -1507,8 +1685,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                 max_offset=max_offset,
             )
             softmax.reset()
-            tile_block_count = n_block_max - n_block_min
-            has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
+            if const_expr(self.use_block_sparsity):
+                tile_block_count = get_total_block_count(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
+                )
+                has_work = tile_block_count > Int32(0)
+            else:
+                tile_block_count = n_block_max - n_block_min
+                has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
             softmax_step = partial(
                 self.softmax_step,
                 softmax=softmax,
@@ -1531,9 +1721,51 @@ class BlackwellFusedMultiHeadAttentionForward:
                 head_divmod=head_divmod,
             )
 
-            if has_work:
+            if const_expr(self.use_block_sparsity) or has_work:
                 pipeline_sm_stats.producer_acquire_w_index_phase(sm_stats_stage, sm_stats_producer_phase)
                 sm_stats_producer_phase ^= 1
+
+            if const_expr(self.use_block_sparsity):
+                if const_expr(aux_tensors is not None):
+                    m_tile_end = (m_block + 1) * self.cta_group_size * self.m_block_size
+                    check_m_boundary = m_tile_end > seqlen.seqlen_q
+                else:
+                    check_m_boundary = False
+                softmax_step_state = p_lastsplit_producer_phase + stage * Int32(2)
+                (
+                    mma_si_consumer_phase,
+                    sm_stats_producer_phase,
+                    softmax_step_state,
+                    empty_tile,
+                ) = softmax_block_sparse_sm100(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    seqlen,
+                    partial(self.softmax_step_block_sparse, softmax_step=softmax_step),
+                    mask_fn,
+                    mask_fn_none,
+                    mma_si_consumer_phase,
+                    sm_stats_producer_phase,
+                    softmax_step_state,
+                    pipeline_sm_stats,
+                    sm_stats_barrier,
+                    1,
+                    sm_stats_stage,
+                    check_m_boundary,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                )
+                p_lastsplit_producer_phase = softmax_step_state % Int32(2)
+                stage = softmax_step_state // Int32(2)
+                if not empty_tile:
+                    sScale[tidx + self.m_block_size] = softmax.row_sum[0]
+                    if const_expr(mLSE is not None or learnable_sink is not None):
+                        sScale[tidx + self.m_block_size * 2] = softmax.row_max[0]
+                    sm_stats_barrier.arrive_w_index(index=sm_stats_stage * 4 + warp_idx)
+
+            if has_work and const_expr(not self.use_block_sparsity):
                 mma_si_consumer_phase, sm_stats_producer_phase, p_lastsplit_producer_phase = softmax_step(
                     mma_si_consumer_phase,
                     sm_stats_producer_phase,
@@ -1618,14 +1850,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        sO: cute.Tensor,
+        gmem_tiled_copy_O: Optional[cute.TiledCopy],
         pipeline_o_acc: pipeline.PipelineAsync,
         pipeline_sm_stats,
         sm_stats_barrier,
+        pipeline_o_epi: Optional[pipeline.PipelineAsync],
         learnable_sink: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
@@ -1636,6 +1872,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         sm_stats_consumer_phase = Int32(0)
         o_corr_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.o_stage
+        )
+        o_epi_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.o_stage
         )
 
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1649,17 +1888,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
             m_tile_idx = m_block * self.cta_group_size + mma_tile_coord_v
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
-
-            # (bM, bN, loopM, loopN, loopL)
             gO = cute.local_tile(
                 mO_cur,
-                cute.select(self.block_tiler_pv, mode=[0, 1]),
-                (m_tile_idx, None),
-            )
-            tOcO = cute.local_tile(
-                cute.make_identity_tensor(mO_cur.shape),
-                cute.select(self.block_tiler_pv, mode=[0, 1]),
-                (m_tile_idx, None),
+                self.epi_tile,
+                (m_tile_idx, 0),
             )
             stats = (
                 Float32(0.0),
@@ -1672,8 +1904,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
 
-            total_block_count = n_block_max - n_block_min
-            has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
+            if const_expr(self.use_block_sparsity):
+                total_block_count = get_total_block_count(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
+                )
+                has_work = total_block_count > Int32(0)
+            else:
+                total_block_count = n_block_max - n_block_min
+                has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
             if has_work:
                 # The first accumulated O tile has no previous scale correction.
@@ -1720,17 +1964,64 @@ class BlackwellFusedMultiHeadAttentionForward:
                 stats = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                 pipeline_o_acc.consumer_wait(o_corr_consumer_state)
+                if const_expr(not self.use_correction_warps_for_epi):
+                    pipeline_o_epi.producer_acquire(o_epi_producer_state)
                 self.correction_epilogue(
+                    thr_mma_pv,
+                    tOtO,
+                    tidx,
+                    m_tile_idx,
                     seqlen.seqlen_q,
                     scale,
+                    sO[None, None, 0],
+                    mO_cur,
                     gO,
-                    tOcO,
-                    tOtO,
-                    self.epi_tile,
+                    gmem_tiled_copy_O,
                 )
                 pipeline_o_acc.consumer_release(o_corr_consumer_state)
+                if const_expr(not self.use_correction_warps_for_epi):
+                    pipeline_o_epi.producer_commit(o_epi_producer_state)
+                    o_epi_producer_state.advance()
                 o_corr_consumer_state.advance()
                 sm_stats_consumer_phase ^= 1
+            elif const_expr(self.use_block_sparsity):
+                sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                pipeline_sm_stats.consumer_release_w_index(0)
+                sm_stats_consumer_phase ^= 1
+                row_sum = Float32(1.0)
+                row_max = (
+                    -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None
+                )
+                if const_expr(learnable_sink is not None):
+                    LOG2_E = math.log2(math.e)
+                    sink_val = Float32(learnable_sink[head_idx])
+                    if row_max == -Float32.inf:
+                        row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
+                        row_sum = max_offset_scale
+                    else:
+                        row_sum += cute.math.exp2(
+                            sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset,
+                            fastmath=True,
+                        )
+                acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                stats = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                if const_expr(not self.use_correction_warps_for_epi):
+                    pipeline_o_epi.producer_acquire(o_epi_producer_state)
+                self.correction_epilogue(
+                    thr_mma_pv,
+                    tOtO,
+                    tidx,
+                    m_tile_idx,
+                    seqlen.seqlen_q,
+                    Float32(0.0),
+                    sO[None, None, 0],
+                    mO_cur,
+                    gO,
+                    gmem_tiled_copy_O,
+                )
+                if const_expr(not self.use_correction_warps_for_epi):
+                    pipeline_o_epi.producer_commit(o_epi_producer_state)
+                    o_epi_producer_state.advance()
 
             if const_expr(mLSE is not None):
                 if const_expr(not seqlen.has_cu_seqlens_q):
@@ -1753,6 +2044,69 @@ class BlackwellFusedMultiHeadAttentionForward:
                     gLSE[tidx] = lse
             work_tile = tile_scheduler.advance_to_next_work()
         # TMEM free is owned by the MMA warp after softmax/correction arrive.
+        if const_expr(not self.use_correction_warps_for_epi):
+            pipeline_o_epi.producer_tail(o_epi_producer_state)
+
+    @cute.jit
+    def epilogue_s2g(
+        self,
+        mO: cute.Tensor,
+        sO: cute.Tensor,
+        gmem_tiled_copy_O: Optional[cute.TiledCopy],
+        tma_atom_O: Optional[cute.CopyAtom],
+        pipeline_o_epi: pipeline.PipelineAsync,
+        block_info: BlockInfo,
+        num_splits: Int32,
+        SeqlenInfoCls: Callable,
+        mma_tile_coord_v: Int32 = 0,
+        tile_scheduler=None,
+    ):
+        o_epi_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.o_stage
+        )
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            m_tile_idx = m_block * self.cta_group_size + mma_tile_coord_v
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+
+            gO = cute.local_tile(
+                mO_cur,
+                self.epi_tile,
+                (m_tile_idx, 0),
+            )
+
+            pipeline_o_epi.consumer_wait(o_epi_consumer_state)
+            if const_expr(self.use_tma_O):
+                store_O, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_O,
+                    0,
+                    cute.make_layout(1),
+                    sO[None, None, 0],
+                    gO,
+                    single_stage=True,
+                )
+                store_O()
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            else:
+                tidx = cute.arch.thread_idx()[0] % (
+                    cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+                )
+                self._store_O_to_gmem(
+                    sO[None, None, 0],
+                    gO,
+                    mO_cur,
+                    gmem_tiled_copy_O,
+                    tidx,
+                    seqlen.seqlen_q,
+                    m_tile_idx,
+                )
+            pipeline_o_epi.consumer_release(o_epi_consumer_state)
+            o_epi_consumer_state.advance()
+
+            work_tile = tile_scheduler.advance_to_next_work()
 
     @cute.jit
     def softmax_step(
@@ -1989,31 +2343,20 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def correction_epilogue(
         self,
+        thr_mma: cute.core.ThrMma,
+        tOtO: cute.Tensor,
+        tidx: Int32,
+        m_tile_idx: Int32,
         seqlen_q: Int32,
         scale: Float32,
-        gO: cute.Tensor,
-        tOcO: cute.Tensor,
-        tOtO: cute.Tensor,
-        epi_tile: cute.Tile,
+        sO: cute.Tensor,
+        mO_cur: Optional[cute.Tensor] = None,
+        gO: Optional[cute.Tensor] = None,
+        gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
     ):
-        """Apply final scaling and transformation to attention output before writing to global memory.
-
-        This correction_epilogue function handles the final processing step for attention output values.
-        It applies a scaling factor to the accumulated attention results and prepares the
-        data for efficient transfer back to global memory.
-
-        The method performs:
-        1. Loading of accumulated attention results from tensor memory
-        2. Application of the final output scaling factor
-        3. Type conversion if necessary (typically from higher precision accumulator to output precision)
-        4. Reorganization of data for optimal memory access patterns
-        5. Preparation for efficient global memory stores
-        """
-        tidx = cute.arch.thread_idx()[0] % (
-            cute.arch.WARP_SIZE * len(self.correction_warp_ids)
-        )
+        """Apply final scaling and stage the attention output in shared memory."""
         corr_tile_size = 8 * 32 // self.o_dtype.width
-        epi_subtile = (epi_tile[0], corr_tile_size)
+        epi_subtile = (self.m_block_size, corr_tile_size)
         tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
             self.mma_tiler_pv,
             self.o_layout,
@@ -2022,28 +2365,47 @@ class BlackwellFusedMultiHeadAttentionForward:
             epi_subtile,
             use_2cta_instrs=self.use_2cta_instrs,
         )
-        for stage in cutlass.range(self.pv_hdim_stage):
-            gO_stage = gO[None, None, stage]
-            tOcO_stage = tOcO[None, None, stage]
-            tOtO_stage = tOtO[(None, None), 0, 0, stage]
+
+        for hdim_stage in cutlass.range_constexpr(self.pv_hdim_stage):
+            tOtO_stage = tOtO[(None, None), 0, 0, hdim_stage]
+            sO_stage = cute.local_tile(
+                sO,
+                cute.select(self.block_tiler_pv, mode=[0, 1]),
+                (0, hdim_stage),
+            )
+
+            # Use CTA 0 mapping for smem partitioning since sO is per-CTA sized.
+            tOsO = thr_mma.get_slice(0).partition_C(sO_stage)
+            tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
+
             tOtO_i = cute.logical_divide(
                 tOtO_stage, cute.make_layout((self.m_block_size, corr_tile_size))
             )
             tOcO_i = cute.logical_divide(
-                tOcO_stage, cute.make_layout((self.m_block_size, corr_tile_size))
+                tOcO, cute.make_layout((self.m_block_size, corr_tile_size))
             )
-            tOgO_i = cute.logical_divide(
-                gO_stage, cute.make_layout((self.m_block_size, corr_tile_size))
+            tOsO_i = cute.logical_divide(
+                tOsO, cute.make_layout((self.m_block_size, corr_tile_size))
             )
+
             tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
             thr_tmem_load = tiled_tmem_load.get_slice(tidx)
+            smem_copy_atom = sm100_utils_basic.get_smem_store_op(
+                self.o_layout,
+                self.o_dtype,
+                self.pv_acc_dtype,
+                tiled_tmem_load,
+            )
+            tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
+
             tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
-            tOgO_r2g = thr_tmem_load.partition_D(tOgO_i[(None, None), None])
+            tOsO_s2r = copy_utils.partition_D_position_independent(
+                thr_tmem_load, tOsO_i[(None, None), None]
+            )
             tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
             for i in cutlass.range(self.mma_tiler_pv[1] // corr_tile_size, unroll_full=True):
                 tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
-                tOgO_r2g_i = tOgO_r2g[None, 0, 0, i]
-                tOcO_t2r_i = tOcO_t2r[None, 0, 0, i]
+                tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
                 tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
                 cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
                 for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
@@ -2051,8 +2413,55 @@ class BlackwellFusedMultiHeadAttentionForward:
                         (tOrO_frg[j], tOrO_frg[j + 1]),
                         (scale, scale),
                     )
-                tOrO_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
-                o_vec = tOrO_frg.load()
-                tOrO_cvt.store(o_vec.to(self.o_dtype))
-                if cute.elem_less(tOcO_t2r_i[0][0], seqlen_q):
-                    cute.autovec_copy(tOrO_cvt, tOgO_r2g_i)
+                copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+        cute.arch.fence_view_async_shared()
+
+        if const_expr(self.use_correction_warps_for_epi):
+            assert not self.use_tma_O
+            assert gmem_tiled_copy_O is not None
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                number_of_threads=len(self.epilogue_warp_ids) * cute.arch.WARP_SIZE,
+            )
+            self._store_O_to_gmem(
+                sO,
+                gO,
+                mO_cur,
+                gmem_tiled_copy_O,
+                tidx,
+                seqlen_q,
+                m_tile_idx,
+            )
+
+    @cute.jit
+    def _store_O_to_gmem(
+        self,
+        sO_stage: cute.Tensor,
+        gO: cute.Tensor,
+        mO_cur: cute.Tensor,
+        gmem_tiled_copy_O: cute.TiledCopy,
+        tidx: Int32,
+        seqlen_q: Int32,
+        m_tile_idx: Int32,
+    ):
+        """Copy O from smem to gmem via registers."""
+        gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+        tOsO = gmem_thr_copy_O.partition_S(sO_stage)
+        cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
+        tOcO = gmem_thr_copy_O.partition_S(cO)
+        t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
+        tOpO = copy_utils.predicate_k(tOcO, limit=mO_cur.shape[1])
+
+        tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
+        cute.autovec_copy(tOsO, tOrO)
+        tOgO = gmem_thr_copy_O.partition_D(gO)
+        for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+            if t0OcO[0, rest_m, 0][0] < seqlen_q - m_tile_idx * self.m_block_size - tOcO[0][0]:
+                cute.copy(
+                    gmem_tiled_copy_O,
+                    tOrO[None, rest_m, None],
+                    tOgO[None, rest_m, None],
+                    pred=tOpO[None, rest_m, None]
+                    if const_expr(self.check_hdim_v_oob)
+                    else None,
+                )

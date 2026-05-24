@@ -134,7 +134,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert tile_m_dkdv == 128 and tile_n_dkdv == 64, (
             "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
         )
-        assert mask_mod is None, "SM100 backward with head_dim=256 does not support mask_mod"
         assert cluster_size in (1, 2), (
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
         )

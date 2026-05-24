@@ -60,8 +60,8 @@ def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -
         "H100 PCIe": 756e12,
         "H200": 989e12,
         "H20": 148e12,
-        "GB200": 2.5e15,
-        "GB300": 2.5e15,
+        "GB200": 2.25e15,
+        "GB300": 2.25e15,
         "B300": 2.25e15,
         "B200": 2.25e15,
     }
@@ -238,6 +238,7 @@ def bench_bwd(batch, seqlen, nheads, nheads_kv, causal,
 
     try:
         out, lse = _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, return_lse=True)
+        torch.cuda.synchronize()
     except Exception as e:
         return None, None, str(e)[:120]
 
@@ -249,6 +250,7 @@ def bench_bwd(batch, seqlen, nheads, nheads_kv, causal,
     try:
         with _suppress_stdout_stderr():
             dq, dk, dv = fn()  # compile / warm JIT — suppresses kernel debug prints
+        torch.cuda.synchronize()
     except Exception as e:
         return None, None, str(e)[:120]
 
@@ -274,8 +276,9 @@ def bench_bwd(batch, seqlen, nheads, nheads_kv, causal,
         grad_errs = (dq_err, dk_err, dv_err)
 
     with _suppress_stdout_stderr():
+        grads = (dq, dk, dv)
         for _ in range(warmup):
-            fn()
+            grads = fn()
 
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
@@ -283,7 +286,7 @@ def bench_bwd(batch, seqlen, nheads, nheads_kv, causal,
     start.record()
     with _suppress_stdout_stderr():
         for _ in range(rep):
-            fn()
+            grads = fn()
     end.record()
     torch.cuda.synchronize()
 
@@ -359,6 +362,7 @@ def bench_varlen_bwd(total_len, doc_len, nheads, nheads_kv, causal,
             causal=causal,
             return_lse=True,
         )
+        torch.cuda.synchronize()
     except Exception as e:
         return None, None, str(e)[:120]
 
@@ -382,13 +386,14 @@ def bench_varlen_bwd(total_len, doc_len, nheads, nheads_kv, causal,
 
     try:
         with _suppress_stdout_stderr():
-            fn()
+            grads = fn()
+        torch.cuda.synchronize()
     except Exception as e:
         return None, None, str(e)[:120]
 
     with _suppress_stdout_stderr():
         for _ in range(warmup):
-            fn()
+            grads = fn()
 
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
@@ -396,7 +401,7 @@ def bench_varlen_bwd(total_len, doc_len, nheads, nheads_kv, causal,
     start.record()
     with _suppress_stdout_stderr():
         for _ in range(rep):
-            fn()
+            grads = fn()
     end.record()
     torch.cuda.synchronize()
 

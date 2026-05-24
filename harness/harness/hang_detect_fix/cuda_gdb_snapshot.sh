@@ -15,8 +15,14 @@ mkdir -p "$(dirname "$LOG")"
 
 cuda-gdb --pid "$PID" \
     -batch \
+    -ex "set confirm off" \
+    -ex "set pagination off" \
+    -ex "set debuginfod enabled off" \
     -ex "set logging file $LOG" \
     -ex "set logging on" \
+    -ex "interrupt" \
+    -ex "info threads" \
+    -ex "thread apply all bt" \
     -ex "info cuda kernels" \
     -ex "info cuda warps" \
     -ex "info cuda threads sm 0" \

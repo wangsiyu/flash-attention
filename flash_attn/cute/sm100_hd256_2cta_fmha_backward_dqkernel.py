@@ -88,7 +88,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         assert not is_persistent
         assert cluster_size == 2
         assert self.use_2cta_instrs
-        assert mask_mod is None
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -1871,11 +1870,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                mask_mod=None,
+                mask_mod=self.mask_mod,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                aux_tensors=None,
-                fastdiv_mods=(None, None),
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
                 head_divmod=None,
                 r2p=True,
                 rBitmask=None,

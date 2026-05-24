@@ -87,13 +87,13 @@ def merge_values(
         dst[key]["sdpa"].extend(value["sdpa"])
 
 
-def median_map(
+def aggregate_map(
     values: dict[tuple[str, str, str, int, int], dict[str, list[float]]]
 ) -> dict[tuple[str, str, str, int, int], BenchStats]:
     return {
         key: BenchStats(
-            fa=statistics.median(v["fa"]),
-            sdpa=statistics.median(v["sdpa"]) if v["sdpa"] else None,
+            fa=statistics.mean(v["fa"]),
+            sdpa=statistics.mean(v["sdpa"]) if v["sdpa"] else None,
         )
         for key, v in values.items()
         if v["fa"]
@@ -154,7 +154,7 @@ def append_current_tables(
             lines += [
                 f"### {direction}",
                 "",
-                "| Mask | Total/Seqlen | Doc Len | FA Median TFLOPS | SDPA Median TFLOPS | FA/SDPA | Gap vs SDPA |",
+                "| Mask | Total/Seqlen | Doc Len | FA TFLOPS | SDPA TFLOPS | FA/SDPA | Gap vs SDPA |",
                 "| ---- | ------------ | ------- | ---------------- | ------------------ | ------- | ----------- |",
             ]
             for key in sorted(rows, key=sort_row_key):
@@ -192,7 +192,7 @@ def append_comparison_tables(
             lines += [
                 f"### {direction}",
                 "",
-                "| Mask | Total/Seqlen | Doc Len | Previous FA TFLOPS | Current FA TFLOPS | FA Delta | Status | SDPA Median TFLOPS | FA/SDPA | Gap vs SDPA |",
+                "| Mask | Total/Seqlen | Doc Len | Previous FA TFLOPS | Current FA TFLOPS | FA Delta | Status | SDPA TFLOPS | FA/SDPA | Gap vs SDPA |",
                 "| ---- | ------------ | ------- | ------------------ | ----------------- | -------- | ------ | ------------------ | ------- | ----------- |",
             ]
             for key in sorted(rows, key=sort_row_key):
@@ -232,8 +232,8 @@ def main() -> int:
 
     current_values = parse_logs(args.current)
     merge_values(current_values, parse_sdpa_baseline(args.sdpa_baseline))
-    current = median_map(current_values)
-    previous = median_map(parse_logs(args.previous))
+    current = aggregate_map(current_values)
+    previous = aggregate_map(parse_logs(args.previous))
 
     args.report.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -268,7 +268,7 @@ def main() -> int:
             "",
             "## Regression Action",
             "",
-            "Systemic regression detected from repeated benchmark medians.",
+            "Systemic regression detected from benchmark comparison.",
             "Export SASS for before/after kernels or run equivalent experiment analysis before modifying further.",
             "Do not submit or lock this round until performance is recovered.",
             "",

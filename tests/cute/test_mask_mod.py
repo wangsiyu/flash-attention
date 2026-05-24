@@ -837,8 +837,8 @@ def test_sm100_block_sparse_sink_all_masked():
     batch_size = 1
     seqlen_q = 256
     seqlen_k = 128
-    nheads = 8
-    headdim = 128
+    nheads = 4
+    headdim = 256
     q = torch.randn(batch_size, seqlen_q, nheads, headdim, dtype=dtype, device=device)
     k = torch.randn(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
     v = torch.randn(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
@@ -871,6 +871,46 @@ def test_sm100_block_sparse_sink_all_masked():
     # Fully masked tile ⇒ probability mass sits entirely on the sink, so LSE equals sink logit.
     expected = learnable_sink.float()[None, :, None].expand_as(lse)
     assert torch.allclose(lse, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_hd256_dense_mask_mod_autograd():
+    torch.manual_seed(0)
+    seqlen_q = 256
+    seqlen_k = 256
+    batch_size = 1
+    nheads = 2
+    headdim = 256
+    dtype = torch.bfloat16
+
+    mask_mod_cute, _ = get_mask_pair(
+        "block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None
+    )
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype, requires_grad=True
+    )
+
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0 / math.sqrt(headdim),
+        mask_mod=mask_mod_cute,
+        return_lse=True,
+    )
+    out.float().sum().backward()
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(lse).all()
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(k.grad).all()
+    assert torch.isfinite(v.grad).all()
 
 
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
@@ -920,8 +960,8 @@ def test_sm100_block_sparse_coarse_blocks():
     torch.manual_seed(42)
     seqlen_q = 512
     seqlen_k = 512
-    nheads = 4
-    headdim = 128
+    nheads = 2
+    headdim = 256
     dtype = torch.bfloat16
     tile_m = 128
     tile_n = 128
@@ -1018,7 +1058,7 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
     seqlen_q = 1024
     seqlen_k = 512
     nheads = 2
-    headdim = 128
+    headdim = 256
     dtype = torch.bfloat16
     tile_m = 128
     tile_n = 128
