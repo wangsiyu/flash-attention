@@ -43,11 +43,254 @@ import io
 import math
 import os
 import sys
+import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+_flash_attn_fwd = None
+_flash_attn_bwd = None
+IMPL_LABEL = "FA4"
+
+
+def _install_flash_moe_namespace(flash_moe_src: str) -> None:
+    root = Path(flash_moe_src).resolve()
+    for name, rel in [
+        ("flash_moe", "flash_moe"),
+        ("flash_moe.nn", "flash_moe/nn"),
+        ("flash_moe.nn.functional", "flash_moe/nn/functional"),
+    ]:
+        mod = types.ModuleType(name)
+        mod.__path__ = [str(root / rel)]
+        sys.modules[name] = mod
+    sys.path.insert(0, str(root))
+
+
+def configure_impl(impl: str, flash_moe_src: str | None = None) -> None:
+    global _flash_attn_fwd, _flash_attn_bwd, IMPL_LABEL
+    if impl == "fa4":
+        from flash_attn.cute.interface import _flash_attn_bwd as fa4_bwd
+        from flash_attn.cute.interface import _flash_attn_fwd as fa4_fwd
+
+        _flash_attn_fwd = fa4_fwd
+        _flash_attn_bwd = fa4_bwd
+        IMPL_LABEL = "FA4"
+        return
+
+    if impl == "bladnn_fa4":
+        if flash_moe_src is None:
+            raise SystemExit("--flash-moe-src must point to flash-attention-4 repo when --impl bladnn_fa4")
+        sys.path.insert(0, str(Path(flash_moe_src).resolve()))
+        from bladnn_fa4.interface import (
+            _flash_attn_backward_sm100,
+            _flash_attn_forward_sm100,
+        )
+
+        def bladnn_fa4_fwd(
+            q,
+            k,
+            v,
+            *,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            softmax_scale=None,
+            causal=False,
+            window_size=(-1, -1),
+            return_lse=False,
+        ):
+            if max_seqlen_q is None:
+                max_seqlen_q = (
+                    q.shape[-3]
+                    if cu_seqlens_q is None
+                    else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+                )
+            if max_seqlen_k is None:
+                max_seqlen_k = (
+                    k.shape[-3]
+                    if cu_seqlens_k is None
+                    else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+                )
+            return _flash_attn_forward_sm100(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                None,
+                None,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                return_lse=True,
+            )
+
+        def bladnn_fa4_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            *,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            softmax_scale=None,
+            causal=False,
+            window_size=(-1, -1),
+        ):
+            if max_seqlen_q is None:
+                max_seqlen_q = (
+                    q.shape[-3]
+                    if cu_seqlens_q is None
+                    else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+                )
+            if max_seqlen_k is None:
+                max_seqlen_k = (
+                    k.shape[-3]
+                    if cu_seqlens_k is None
+                    else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+                )
+            dq = torch.empty_like(q)
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+            return _flash_attn_backward_sm100(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                None,
+                None,
+                max_seqlen_q,
+                max_seqlen_k,
+                dq,
+                dk,
+                dv,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+            )
+
+        _flash_attn_fwd = bladnn_fa4_fwd
+        _flash_attn_bwd = bladnn_fa4_bwd
+        IMPL_LABEL = "FA4-v0.2.1-2CTA"
+        return
+
+    if flash_moe_src is None:
+        raise SystemExit("--flash-moe-src is required when --impl flash_moe")
+    _install_flash_moe_namespace(flash_moe_src)
+    from flash_moe.nn.functional.flash_attn.interface import (
+        _flash_attn_backward_sm100,
+        _flash_attn_forward_sm100,
+    )
+
+    def flash_moe_fwd(
+        q,
+        k,
+        v,
+        *,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        return_lse=False,
+    ):
+        if max_seqlen_q is None:
+            max_seqlen_q = (
+                q.shape[-3]
+                if cu_seqlens_q is None
+                else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+            )
+        if max_seqlen_k is None:
+            max_seqlen_k = (
+                k.shape[-3]
+                if cu_seqlens_k is None
+                else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+            )
+        return _flash_attn_forward_sm100(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=True,
+        )
+
+    def flash_moe_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        *,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+    ):
+        if max_seqlen_q is None:
+            max_seqlen_q = (
+                q.shape[-3]
+                if cu_seqlens_q is None
+                else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+            )
+        if max_seqlen_k is None:
+            max_seqlen_k = (
+                k.shape[-3]
+                if cu_seqlens_k is None
+                else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+            )
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        return _flash_attn_backward_sm100(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+        )
+
+    _flash_attn_fwd = flash_moe_fwd
+    _flash_attn_bwd = flash_moe_bwd
+    IMPL_LABEL = "FlashMoE"
 
 def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -> float | None:
     """Return peak dense FLOPS for the current GPU without importing FA2 helpers."""
@@ -514,7 +757,7 @@ def run_default(args, peak_flops=None, suite_label=None, check_correctness=True)
     for direction in directions:
         dir_label = "Forward" if direction == "fwd" else "Backward"
 
-        tflops_col = "FA4 TFLOPS(MFU%)" if has_mfu else "Throughput (TFLOPS)"
+        tflops_col = f"{IMPL_LABEL} TFLOPS(MFU%)" if has_mfu else "Throughput (TFLOPS)"
         tflops_w = max(len(tflops_col), 18)
 
         if direction == "fwd":
@@ -527,7 +770,7 @@ def run_default(args, peak_flops=None, suite_label=None, check_correctness=True)
 
         width = len(hdr)
         print(f"\n{'=' * width}")
-        print(f"  SM100 Blackwell  head_dim=256  2CTA  {dir_label}  "
+        print(f"  SM100 Blackwell  head_dim=256  {IMPL_LABEL}  {dir_label}  "
               f"suite={suite_label}  nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
         print(f"{'=' * width}")
         print(hdr)
@@ -579,14 +822,14 @@ def run_varlen(args, peak_flops=None, suite_label=None):
     for direction in directions:
         dir_label = "Forward" if direction == "fwd" else "Backward"
 
-        tflops_col = "FA4 TFLOPS(MFU%)" if has_mfu else "Throughput (TFLOPS)"
+        tflops_col = f"{IMPL_LABEL} TFLOPS(MFU%)" if has_mfu else "Throughput (TFLOPS)"
         tflops_w = max(len(tflops_col), 18)
         hdr = (f"{'Config (attn-mask / total doc)':<38} {'Docs':>6} "
                f"{'Latency (ms)':>14} {tflops_col:>{tflops_w}}")
 
         width = len(hdr)
         print(f"\n{'=' * width}")
-        print(f"  SM100 Blackwell  head_dim=256  2CTA  {dir_label}  "
+        print(f"  SM100 Blackwell  head_dim=256  {IMPL_LABEL}  {dir_label}  "
               f"suite={suite_label}  nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
         print(f"{'=' * width}")
         print(hdr)
@@ -872,9 +1115,16 @@ def main():
                         help="Compile kernels without benchmarking (two-pass step 1)")
     parser.add_argument("--sdpa-only",        action="store_true",
                         help="Run only the PyTorch SDPA baseline for the selected suite")
+    parser.add_argument("--impl", choices=["fa4", "flash_moe", "bladnn_fa4"], default="fa4")
+    parser.add_argument(
+        "--flash-moe-src",
+        default=os.environ.get("FLASH_MOE_SRC"),
+        help="Path to flash-moe/src when --impl flash_moe",
+    )
 
     args = parser.parse_args()
     torch.manual_seed(0)
+    configure_impl(args.impl, args.flash_moe_src)
     peak_flops = check_sm100()
 
     if args.compile_only:

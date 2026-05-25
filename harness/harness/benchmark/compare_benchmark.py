@@ -66,10 +66,14 @@ def parse_log_paths(
     return values
 
 
-def parse_logs(directory: Path, metric: str = "fa") -> dict[tuple[str, str, str, int, int], dict[str, list[float]]]:
+def parse_logs(
+    directory: Path,
+    metric: str = "fa",
+    pattern: str = "run_*.log",
+) -> dict[tuple[str, str, str, int, int], dict[str, list[float]]]:
     if not directory.exists():
         return defaultdict(lambda: {"fa": [], "sdpa": []})
-    return parse_log_paths(list(directory.glob("run_*.log")), metric)
+    return parse_log_paths(list(directory.glob(pattern)), metric)
 
 
 def parse_sdpa_baseline(path: Path | None) -> dict[tuple[str, str, str, int, int], dict[str, list[float]]]:
@@ -124,6 +128,17 @@ def sdpa_columns(stats: BenchStats) -> tuple[str, str, str]:
     return f"{stats.sdpa:.1f}", f"{speedup:.2f}x", f"{gap:+.1f}%"
 
 
+def impl_columns(
+    current_stats: BenchStats,
+    other_stats: BenchStats | None,
+) -> tuple[str, str, str]:
+    if other_stats is None:
+        return "n/a", "n/a", "n/a"
+    speedup = other_stats.fa / current_stats.fa if current_stats.fa else 0.0
+    gap = (speedup - 1.0) * 100
+    return f"{other_stats.fa:.1f}", f"{speedup:.2f}x", f"{gap:+.1f}%"
+
+
 def append_source_stamp(lines: list[str], path: Path | None) -> None:
     if path is None or not path.exists():
         return
@@ -140,6 +155,7 @@ def append_source_stamp(lines: list[str], path: Path | None) -> None:
 def append_current_tables(
     lines: list[str],
     current: dict[tuple[str, str, str, int, int], BenchStats],
+    flash_moe: dict[tuple[str, str, str, int, int], BenchStats] | None = None,
 ) -> None:
     keys = set(current)
     for suite in sorted({key[0] for key in keys}):
@@ -154,21 +170,21 @@ def append_current_tables(
             lines += [
                 f"### {direction}",
                 "",
-                "| Mask | Total/Seqlen | Doc Len | FA TFLOPS | SDPA TFLOPS | FA/SDPA | Gap vs SDPA |",
-                "| ---- | ------------ | ------- | ---------------- | ------------------ | ------- | ----------- |",
+                "| Mask | Total/Seqlen | Doc Len | FA TFLOPS | SDPA TFLOPS | FA/SDPA | Gap vs SDPA | FlashMoE TFLOPS | FlashMoE/FA | Gap vs FA |",
+                "| ---- | ------------ | ------- | --------- | ----------- | ------- | ----------- | --------------- | ----------- | --------- |",
             ]
             for key in sorted(rows, key=sort_row_key):
                 _suite, _direction, mask, total, doc = key
                 stats = current[key]
-                if stats.sdpa is None:
-                    lines.append(f"| {mask} | {total} | {doc_text(doc)} | {stats.fa:.1f} | n/a | n/a | n/a |")
-                else:
-                    speedup = stats.fa / stats.sdpa
-                    gap = (speedup - 1.0) * 100
-                    lines.append(
-                        f"| {mask} | {total} | {doc_text(doc)} | {stats.fa:.1f} | {stats.sdpa:.1f} | "
-                        f"{speedup:.2f}x | {gap:+.1f}% |"
-                    )
+                sdpa_text, speedup_text, gap_text = sdpa_columns(stats)
+                moe_text, moe_speedup_text, moe_gap_text = impl_columns(
+                    stats,
+                    flash_moe.get(key) if flash_moe else None,
+                )
+                lines.append(
+                    f"| {mask} | {total} | {doc_text(doc)} | {stats.fa:.1f} | {sdpa_text} | "
+                    f"{speedup_text} | {gap_text} | {moe_text} | {moe_speedup_text} | {moe_gap_text} |"
+                )
             lines.append("")
 
 
@@ -177,6 +193,7 @@ def append_comparison_tables(
     current: dict[tuple[str, str, str, int, int], BenchStats],
     previous: dict[tuple[str, str, str, int, int], BenchStats],
     regression_threshold: float,
+    flash_moe: dict[tuple[str, str, str, int, int], BenchStats] | None = None,
 ) -> list[tuple[tuple[str, str, str, int, int], float, float, float]]:
     keys = set(previous) | set(current)
     regressions: list[tuple[tuple[str, str, str, int, int], float, float, float]] = []
@@ -192,8 +209,8 @@ def append_comparison_tables(
             lines += [
                 f"### {direction}",
                 "",
-                "| Mask | Total/Seqlen | Doc Len | Previous FA TFLOPS | Current FA TFLOPS | FA Delta | Status | SDPA TFLOPS | FA/SDPA | Gap vs SDPA |",
-                "| ---- | ------------ | ------- | ------------------ | ----------------- | -------- | ------ | ------------------ | ------- | ----------- |",
+                "| Mask | Total/Seqlen | Doc Len | Previous FA TFLOPS | Current FA TFLOPS | FA Delta | Status | SDPA TFLOPS | FA/SDPA | Gap vs SDPA | FlashMoE TFLOPS | FlashMoE/FA | Gap vs FA |",
+                "| ---- | ------------ | ------- | ------------------ | ----------------- | -------- | ------ | ----------- | ------- | ----------- | --------------- | ----------- | --------- |",
             ]
             for key in sorted(rows, key=sort_row_key):
                 prev = previous.get(key)
@@ -201,10 +218,21 @@ def append_comparison_tables(
                 _suite, _direction, mask, total, doc = key
                 if prev is None:
                     sdpa_text, speedup_text, gap_text = sdpa_columns(cur)
-                    lines.append(f"| {mask} | {total} | {doc_text(doc)} | n/a | {cur.fa:.1f} | n/a | new | {sdpa_text} | {speedup_text} | {gap_text} |")
+                    moe_text, moe_speedup_text, moe_gap_text = impl_columns(
+                        cur,
+                        flash_moe.get(key) if flash_moe else None,
+                    )
+                    lines.append(
+                        f"| {mask} | {total} | {doc_text(doc)} | n/a | {cur.fa:.1f} | n/a | new | "
+                        f"{sdpa_text} | {speedup_text} | {gap_text} | "
+                        f"{moe_text} | {moe_speedup_text} | {moe_gap_text} |"
+                    )
                     continue
                 if cur is None:
-                    lines.append(f"| {mask} | {total} | {doc_text(doc)} | {prev.fa:.1f} | n/a | n/a | missing | n/a | n/a | n/a |")
+                    lines.append(
+                        f"| {mask} | {total} | {doc_text(doc)} | {prev.fa:.1f} | n/a | n/a | missing | "
+                        "n/a | n/a | n/a | n/a | n/a | n/a |"
+                    )
                     regressions.append((key, prev.fa, 0.0, -1.0))
                     continue
                 delta = (cur.fa - prev.fa) / prev.fa if prev.fa else 0.0
@@ -212,9 +240,14 @@ def append_comparison_tables(
                 if status == "REGRESSION":
                     regressions.append((key, prev.fa, cur.fa, delta))
                 sdpa_text, speedup_text, gap_text = sdpa_columns(cur)
+                moe_text, moe_speedup_text, moe_gap_text = impl_columns(
+                    cur,
+                    flash_moe.get(key) if flash_moe else None,
+                )
                 lines.append(
                     f"| {mask} | {total} | {doc_text(doc)} | {prev.fa:.1f} | {cur.fa:.1f} | "
-                    f"{delta:.1%} | {status} | {sdpa_text} | {speedup_text} | {gap_text} |"
+                    f"{delta:.1%} | {status} | {sdpa_text} | {speedup_text} | {gap_text} | "
+                    f"{moe_text} | {moe_speedup_text} | {moe_gap_text} |"
                 )
             lines.append("")
     return regressions
@@ -227,6 +260,7 @@ def main() -> int:
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--sdpa-baseline", type=Path)
     parser.add_argument("--source-stamp", type=Path)
+    parser.add_argument("--flash-moe", type=Path)
     parser.add_argument("--regression-threshold", type=float, default=0.03)
     args = parser.parse_args()
 
@@ -234,6 +268,11 @@ def main() -> int:
     merge_values(current_values, parse_sdpa_baseline(args.sdpa_baseline))
     current = aggregate_map(current_values)
     previous = aggregate_map(parse_logs(args.previous))
+    flash_moe = (
+        aggregate_map(parse_logs(args.flash_moe, pattern="flash_moe_run_*.log"))
+        if args.flash_moe
+        else None
+    )
 
     args.report.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -241,10 +280,12 @@ def main() -> int:
         "",
         f"Current: `{args.current}`",
         f"Previous: `{args.previous}`",
+        f"FlashMoE comparison: `{args.flash_moe}`" if args.flash_moe else "FlashMoE comparison: `n/a`",
         f"SDPA baseline: `{args.sdpa_baseline}`" if args.sdpa_baseline else "SDPA baseline: `n/a`",
         f"Source stamp: `{args.source_stamp}`" if args.source_stamp else "Source stamp: `n/a`",
         f"Regression threshold: `{args.regression_threshold:.1%}`",
         "Gap vs SDPA: `(FA / SDPA - 1)`, positive means FA is faster.",
+        "Gap vs FA: `(FlashMoE / FA - 1)`, positive means FlashMoE is faster.",
         "",
     ]
     append_source_stamp(lines, args.source_stamp)
@@ -256,12 +297,18 @@ def main() -> int:
 
     if not previous:
         lines += ["No previous benchmark directory found. Current run becomes the baseline for the next comparison.", ""]
-        append_current_tables(lines, current)
+        append_current_tables(lines, current, flash_moe=flash_moe)
         args.report.write_text("\n".join(lines) + "\n")
         print(f"[benchmark] wrote {args.report}")
         return 0
 
-    regressions = append_comparison_tables(lines, current, previous, args.regression_threshold)
+    regressions = append_comparison_tables(
+        lines,
+        current,
+        previous,
+        args.regression_threshold,
+        flash_moe=flash_moe,
+    )
 
     if regressions:
         lines += [

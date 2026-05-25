@@ -14,6 +14,8 @@ REP="${BENCHMARK_REP:-1000}"
 WARMUP="${BENCHMARK_WARMUP:-100}"
 SDPA_REP="${BENCHMARK_SDPA_REP:-$REP}"
 SDPA_WARMUP="${BENCHMARK_SDPA_WARMUP:-$WARMUP}"
+FLASH_MOE_ENABLED="${BENCHMARK_FLASH_MOE:-0}"
+FLASH_MOE_REPO="${FLASH_MOE_REPO:-$(cd "$REPO/.." && pwd)/flash-moe}"
 DRY_RUN=0
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -35,6 +37,15 @@ SDPA_CMD=(
     --rep "$SDPA_REP"
     --warmup "$SDPA_WARMUP"
 )
+FLASH_MOE_CMD=(
+    python3
+    "$REPO/harness/harness/benchmark/bench_sm100_hd256.py"
+    --suite gate
+    --impl flash_moe
+    --flash-moe-src "$FLASH_MOE_REPO/src"
+    --rep "$REP"
+    --warmup "$WARMUP"
+)
 
 mkdir -p "$LOG_ROOT"
 
@@ -45,8 +56,11 @@ echo "[benchmark] rep=$REP"
 echo "[benchmark] warmup=$WARMUP"
 echo "[benchmark] sdpa_rep=$SDPA_REP"
 echo "[benchmark] sdpa_warmup=$SDPA_WARMUP"
+echo "[benchmark] flash_moe_enabled=$FLASH_MOE_ENABLED"
+echo "[benchmark] flash_moe_repo=$FLASH_MOE_REPO"
 echo "[benchmark] command=${CMD[*]}"
 echo "[benchmark] sdpa_command=${SDPA_CMD[*]}"
+echo "[benchmark] flash_moe_command=${FLASH_MOE_CMD[*]}"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
@@ -78,7 +92,7 @@ mkdir -p "$CURRENT_DIR"
 (
     cd /tmp
     echo "[benchmark] source_stamp=$SOURCE_STAMP"
-    REPO="$REPO" python3 - <<'PY' | tee "$SOURCE_STAMP"
+    REPO="$REPO" FLASH_MOE_REPO="$FLASH_MOE_REPO" FLASH_MOE_ENABLED="$FLASH_MOE_ENABLED" python3 - <<'PY' | tee "$SOURCE_STAMP"
 import hashlib
 import importlib.metadata as md
 import os
@@ -97,6 +111,8 @@ import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel as dkdv
 import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel as dq
 
 repo = Path(os.environ["REPO"]).resolve()
+flash_moe_repo = Path(os.environ.get("FLASH_MOE_REPO", "")).resolve()
+flash_moe_enabled = os.environ.get("FLASH_MOE_ENABLED") == "1"
 interface_path = Path(interface.__file__).resolve()
 expected = repo / "flash_attn" / "cute" / "interface.py"
 print(f"[benchmark] flash_attn.cute.interface={interface_path}")
@@ -149,6 +165,19 @@ for label, module in [
     ("sm100_hd256_dq", dq),
 ]:
     stamp(label, Path(module.__file__))
+
+if flash_moe_enabled:
+    print(f"[benchmark] flash_moe_repo={flash_moe_repo}")
+    for label, rel in [
+        ("flash_moe_interface", "src/flash_moe/nn/functional/flash_attn/interface.py"),
+        ("flash_moe_fwd", "src/flash_moe/nn/functional/flash_attn/fmha_forward_sm100.py"),
+        ("flash_moe_bwd", "src/flash_moe/nn/functional/flash_attn/fmha_backward_sm100.py"),
+    ]:
+        path = flash_moe_repo / rel
+        if path.exists():
+            stamp(label, path)
+        else:
+            print(f"[source] {label} path={path} MISSING")
 PY
     for i in $(seq 1 "$RUNS"); do
         log="$CURRENT_DIR/run_${i}.log"
@@ -156,15 +185,34 @@ PY
         "${CMD[@]}" 2>&1 | tee "$log"
         echo "[benchmark] DONE run $i"
     done
+    if [[ "$FLASH_MOE_ENABLED" == "1" ]]; then
+        if [[ ! -d "$FLASH_MOE_REPO/src/flash_moe/nn/functional/flash_attn" ]]; then
+            echo "[benchmark] missing flash-moe flash_attn directory: $FLASH_MOE_REPO/src/flash_moe/nn/functional/flash_attn" >&2
+            exit 2
+        fi
+        for i in $(seq 1 "$RUNS"); do
+            log="$CURRENT_DIR/flash_moe_run_${i}.log"
+            echo "[benchmark] START flash-moe run $i -> $log"
+            "${FLASH_MOE_CMD[@]}" 2>&1 | tee "$log"
+            echo "[benchmark] DONE flash-moe run $i"
+        done
+    fi
     sdpa_log="$CURRENT_DIR/sdpa_baseline.log"
     echo "[benchmark] START sdpa baseline -> $sdpa_log"
     "${SDPA_CMD[@]}" 2>&1 | tee "$sdpa_log"
     echo "[benchmark] DONE sdpa baseline"
 )
 
-python3 "$SCRIPT_DIR/compare_benchmark.py" \
-    --current "$CURRENT_DIR" \
-    --previous "$PREVIOUS_DIR" \
-    --sdpa-baseline "$CURRENT_DIR/sdpa_baseline.log" \
-    --source-stamp "$SOURCE_STAMP" \
+COMPARE_CMD=(
+    python3
+    "$SCRIPT_DIR/compare_benchmark.py"
+    --current "$CURRENT_DIR"
+    --previous "$PREVIOUS_DIR"
+    --sdpa-baseline "$CURRENT_DIR/sdpa_baseline.log"
+    --source-stamp "$SOURCE_STAMP"
     --report "$CURRENT_DIR/benchmark_report.md"
+)
+if [[ "$FLASH_MOE_ENABLED" == "1" ]]; then
+    COMPARE_CMD+=(--flash-moe "$CURRENT_DIR")
+fi
+"${COMPARE_CMD[@]}"
