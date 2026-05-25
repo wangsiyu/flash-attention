@@ -19,6 +19,7 @@ HD256 benchmark command with high-repetition timing and previous-run comparison.
 | Override full-matrix runs | `BENCHMARK_RUNS=2 bash harness/harness/benchmark/run_benchmark.sh` |
 | Override inner timing | `BENCHMARK_REP=500 BENCHMARK_WARMUP=50 bash harness/harness/benchmark/run_benchmark.sh` |
 | Override SDPA timing | `BENCHMARK_SDPA_REP=500 BENCHMARK_SDPA_WARMUP=50 bash harness/harness/benchmark/run_benchmark.sh` |
+| Add FlashMoE comparison | `BENCHMARK_FLASH_MOE=1 bash harness/harness/benchmark/run_benchmark.sh` |
 
 ## Fixed Benchmark Command
 
@@ -42,6 +43,13 @@ same logical workload and written to `sdpa_baseline.log`. Reports include FA
 TFLOPS, SDPA TFLOPS, `FA/SDPA`, and `Gap vs SDPA`.
 `Gap vs SDPA = FA / SDPA - 1`; positive means FA is faster, negative means FA
 trails SDPA.
+
+When `BENCHMARK_FLASH_MOE=1` is set, the wrapper also benchmarks the
+`../flash-moe/src/flash_moe/nn/functional/flash_attn/` CuteDSL implementation
+over the same gate matrix. The report adds `FlashMoE TFLOPS`, `FlashMoE/FA`,
+and `Gap vs FA`; positive `Gap vs FA` means FlashMoE is faster than the
+repo-local FA4 CuteDSL implementation. Use `FLASH_MOE_REPO=/path/to/flash-moe`
+to compare against a non-sibling checkout.
 
 Varlen cases are deterministic: for a given total length and document length,
 `cu_seqlens` is built by repeating that exact document length until the total
@@ -74,6 +82,7 @@ that total length.
 | `harness/harness/logs/benchmark/current/` | Current benchmark run logs and report. |
 | `harness/harness/logs/benchmark/previous/` | Previous benchmark run logs used for comparison. |
 | `harness/harness/logs/benchmark/current/benchmark_report.md` | Current-vs-previous comparison and regression decision. |
+| `harness/harness/logs/benchmark/current/flash_moe_run_*.log` | Optional FlashMoE comparison logs when `BENCHMARK_FLASH_MOE=1`. |
 | `harness/harness/logs/benchmark/current/sdpa_baseline.log` | One-pass PyTorch SDPA baseline merged into the report. |
 | `harness/harness/logs/benchmark/current/source_stamp.log` | Git head, package versions, and key CuteDSL module path/SHA/mtime embedded into the report. |
 
