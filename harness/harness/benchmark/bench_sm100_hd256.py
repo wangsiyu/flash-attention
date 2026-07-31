@@ -1,0 +1,1152 @@
+#!/usr/bin/env python
+"""SM100 Blackwell head_dim=256 benchmark (forward + backward).
+
+Benchmarks the new 2CTA kernels added in PR #2412.  Uses the unified
+`_flash_attn_fwd` / `_flash_attn_bwd` API which auto-routes to the
+hd256 2CTA path on SM100/SM110 when head_dim=256.
+
+Usage:
+    # Default: fwd + bwd, seqlens 1k–32k, causal + non-causal
+    python benchmarks/bench_sm100_hd256.py
+
+    # Gate suite: dense MHA, dense GQA, varlen GQA
+    python benchmarks/bench_sm100_hd256.py --suite gate
+
+    # Forward only
+    python benchmarks/bench_sm100_hd256.py --direction fwd
+
+    # Backward only
+    python benchmarks/bench_sm100_hd256.py --direction bwd
+
+    # Custom seqlens / batch
+    python benchmarks/bench_sm100_hd256.py --seqlen 2048,4096,8192 --batch 2
+
+    # Causal only
+    python benchmarks/bench_sm100_hd256.py --causal-only
+
+    # Compare FA hd256 vs PyTorch SDPA baseline
+    python benchmarks/bench_sm100_hd256.py --compare-sdpa
+
+    # Compile kernels without running (for two-pass workflow)
+    python benchmarks/bench_sm100_hd256.py --compile-only
+
+Two-pass workflow (compile in parallel, then run):
+    FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 \\
+        python benchmarks/bench_sm100_hd256.py --compile-only
+
+    FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 \\
+        python benchmarks/bench_sm100_hd256.py
+"""
+import argparse
+import contextlib
+import io
+import math
+import os
+import sys
+import types
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+_flash_attn_fwd = None
+_flash_attn_bwd = None
+IMPL_LABEL = "FA4"
+
+
+def _install_flash_moe_namespace(flash_moe_src: str) -> None:
+    root = Path(flash_moe_src).resolve()
+    for name, rel in [
+        ("flash_moe", "flash_moe"),
+        ("flash_moe.nn", "flash_moe/nn"),
+        ("flash_moe.nn.functional", "flash_moe/nn/functional"),
+    ]:
+        mod = types.ModuleType(name)
+        mod.__path__ = [str(root / rel)]
+        sys.modules[name] = mod
+    sys.path.insert(0, str(root))
+
+
+def configure_impl(impl: str, flash_moe_src: str | None = None) -> None:
+    global _flash_attn_fwd, _flash_attn_bwd, IMPL_LABEL
+    if impl == "fa4":
+        from flash_attn.cute.interface import _flash_attn_bwd as fa4_bwd
+        from flash_attn.cute.interface import _flash_attn_fwd as fa4_fwd
+
+        _flash_attn_fwd = fa4_fwd
+        _flash_attn_bwd = fa4_bwd
+        IMPL_LABEL = "FA4"
+        return
+
+    if impl == "bladnn_fa4":
+        if flash_moe_src is None:
+            raise SystemExit("--flash-moe-src must point to flash-attention-4 repo when --impl bladnn_fa4")
+        sys.path.insert(0, str(Path(flash_moe_src).resolve()))
+        from bladnn_fa4.interface import (
+            _flash_attn_backward_sm100,
+            _flash_attn_forward_sm100,
+        )
+
+        def bladnn_fa4_fwd(
+            q,
+            k,
+            v,
+            *,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            softmax_scale=None,
+            causal=False,
+            window_size=(-1, -1),
+            return_lse=False,
+        ):
+            if max_seqlen_q is None:
+                max_seqlen_q = (
+                    q.shape[-3]
+                    if cu_seqlens_q is None
+                    else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+                )
+            if max_seqlen_k is None:
+                max_seqlen_k = (
+                    k.shape[-3]
+                    if cu_seqlens_k is None
+                    else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+                )
+            return _flash_attn_forward_sm100(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                None,
+                None,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                return_lse=True,
+            )
+
+        def bladnn_fa4_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            *,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            softmax_scale=None,
+            causal=False,
+            window_size=(-1, -1),
+        ):
+            if max_seqlen_q is None:
+                max_seqlen_q = (
+                    q.shape[-3]
+                    if cu_seqlens_q is None
+                    else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+                )
+            if max_seqlen_k is None:
+                max_seqlen_k = (
+                    k.shape[-3]
+                    if cu_seqlens_k is None
+                    else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+                )
+            dq = torch.empty_like(q)
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+            return _flash_attn_backward_sm100(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                None,
+                None,
+                max_seqlen_q,
+                max_seqlen_k,
+                dq,
+                dk,
+                dv,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+            )
+
+        _flash_attn_fwd = bladnn_fa4_fwd
+        _flash_attn_bwd = bladnn_fa4_bwd
+        IMPL_LABEL = "FA4-v0.2.1-2CTA"
+        return
+
+    if flash_moe_src is None:
+        raise SystemExit("--flash-moe-src is required when --impl flash_moe")
+    _install_flash_moe_namespace(flash_moe_src)
+    from flash_moe.nn.functional.flash_attn.interface import (
+        _flash_attn_backward_sm100,
+        _flash_attn_forward_sm100,
+    )
+
+    def flash_moe_fwd(
+        q,
+        k,
+        v,
+        *,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        return_lse=False,
+    ):
+        if max_seqlen_q is None:
+            max_seqlen_q = (
+                q.shape[-3]
+                if cu_seqlens_q is None
+                else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+            )
+        if max_seqlen_k is None:
+            max_seqlen_k = (
+                k.shape[-3]
+                if cu_seqlens_k is None
+                else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+            )
+        return _flash_attn_forward_sm100(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=True,
+        )
+
+    def flash_moe_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        *,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+    ):
+        if max_seqlen_q is None:
+            max_seqlen_q = (
+                q.shape[-3]
+                if cu_seqlens_q is None
+                else int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+            )
+        if max_seqlen_k is None:
+            max_seqlen_k = (
+                k.shape[-3]
+                if cu_seqlens_k is None
+                else int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+            )
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        return _flash_attn_backward_sm100(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+        )
+
+    _flash_attn_fwd = flash_moe_fwd
+    _flash_attn_bwd = flash_moe_bwd
+    IMPL_LABEL = "FlashMoE"
+
+def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -> float | None:
+    """Return peak dense FLOPS for the current GPU without importing FA2 helpers."""
+    peak_bf16_flops = {
+        "A100": 312e12,
+        "A6000": 309.7e12,
+        "L40S": 362e12,
+        "H100 SXM": 989e12,
+        "H100 NVL": 835e12,
+        "H100 PCIe": 756e12,
+        "H200": 989e12,
+        "H20": 148e12,
+        "GB200": 2.25e15,
+        "GB300": 2.25e15,
+        "B300": 2.25e15,
+        "B200": 2.25e15,
+    }
+    device_name = torch.cuda.get_device_name(device_index)
+    peak = None
+    for key in sorted(peak_bf16_flops, key=len, reverse=True):
+        if key.lower() in device_name.lower():
+            peak = peak_bf16_flops[key]
+            break
+    if peak is None:
+        return None
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        peak *= 2
+    return peak
+
+
+@contextlib.contextmanager
+def _suppress_stdout_stderr():
+    """Suppress both Python-level (sys.stdout/err) and C-level (fd 1/2) output.
+
+    Kernel debug prints (e.g. 'H>> shared_storage.size_in_bytes()') are emitted
+    via Python print() during JIT compilation.  Redirecting only the fd is not
+    enough because Python buffers writes through sys.stdout; we must also swap
+    the Python stream objects.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_stdout_fd = os.dup(1)
+    old_stderr_fd = os.dup(2)
+    old_py_stdout = sys.stdout
+    old_py_stderr = sys.stderr
+    try:
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        # Restore Python streams first so subsequent prints go to real stdout
+        sys.stdout = old_py_stdout
+        sys.stderr = old_py_stderr
+        os.dup2(old_stdout_fd, 1)
+        os.dup2(old_stderr_fd, 2)
+        os.close(devnull_fd)
+        os.close(old_stdout_fd)
+        os.close(old_stderr_fd)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+HEAD_DIM = 256
+# Typical number of heads for head_dim=256 (matches newer model variants)
+NHEADS = 8
+NHEADS_KV = 8  # MHA; adjust to test GQA
+GATE_HEAD_CONFIGS = [
+    ("dense_h16_kv16", 16, 16),
+    ("dense_h16_kv1", 16, 1),
+]
+GATE_VARLEN_HEAD_CONFIGS = [
+    ("varlen_h16_kv1", 16, 1),
+]
+
+
+def csv_ints(s):
+    return [int(x.strip()) for x in s.split(",")]
+
+
+def auto_batch(seqlen, batch_arg, total_tokens=32768):
+    return batch_arg if batch_arg > 0 else max(1, total_tokens // seqlen)
+
+
+def fwd_flops(batch, nheads, seqlen, hdim, causal=False):
+    avg_seqlen = seqlen / 2 if causal else seqlen
+    return batch * nheads * 2 * seqlen * avg_seqlen * (hdim + hdim)
+
+
+def bwd_flops(batch, nheads, seqlen, hdim, causal=False):
+    return 2.5 * fwd_flops(batch, nheads, seqlen, hdim, causal=causal)
+
+
+def varlen_flops(total_len, doc_len, nheads, hdim, causal=False):
+    return fwd_flops(total_len // doc_len, nheads, doc_len, hdim, causal=causal)
+
+
+def make_replicated_cu_seqlens(total_len, doc_len):
+    if total_len % doc_len != 0:
+        raise ValueError(f"total_len={total_len} must be divisible by doc_len={doc_len}")
+    return torch.arange(0, total_len + doc_len, doc_len, dtype=torch.int32, device="cuda")
+
+
+def varlen_doc_lens_for_total(total_len, doc_lens_override=None):
+    if doc_lens_override is not None:
+        return [doc_len for doc_len in doc_lens_override if doc_len <= total_len and total_len % doc_len == 0]
+    doc_lens = []
+    doc_len = 128
+    while doc_len <= total_len:
+        if total_len % doc_len == 0:
+            doc_lens.append(doc_len)
+        doc_len *= 2
+    return doc_lens
+
+
+def check_sm100():
+    if not torch.cuda.is_available():
+        print("ERROR: No CUDA device found.", file=sys.stderr)
+        sys.exit(1)
+    cap = torch.cuda.get_device_capability()
+    name = torch.cuda.get_device_name()
+    peak = get_peak_flops(0, dtype=torch.bfloat16)
+    peak_str = f"  peak_bf16={peak/1e12:.0f} TFLOPS" if peak else ""
+    if cap[0] not in (10, 11):
+        print(
+            f"WARNING: This benchmark targets SM100/SM110 (Blackwell). "
+            f"Current GPU: {name} (SM{cap[0]}{cap[1]}). "
+            f"The hd256 2CTA kernel may not be selected.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"GPU: {name}  (SM{cap[0]}{cap[1]}){peak_str}")
+    return peak
+
+
+# ── Core bench functions ────────────────────────────────────────────────────
+
+def bench_fwd(batch, seqlen, nheads, nheads_kv, causal,
+              check_correctness=True, warmup=5, rep=30):
+    """Benchmark hd256 forward pass. Returns (ms, tflops, max_diff_or_error)."""
+    q = torch.randn(batch, seqlen, nheads,    HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(batch, seqlen, nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(batch, seqlen, nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    scale = HEAD_DIM ** -0.5
+
+    try:
+        out, _lse = _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal)
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+    max_diff = None
+    if check_correctness:
+        # Expand KV heads if GQA
+        gqa = nheads // nheads_kv
+        q_ref = q.transpose(1, 2).float()
+        k_ref = k.transpose(1, 2).float().repeat_interleave(gqa, dim=1)
+        v_ref = v.transpose(1, 2).float().repeat_interleave(gqa, dim=1)
+        out_ref = F.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, is_causal=causal, scale=scale
+        )
+        out_ref = out_ref.transpose(1, 2).to(torch.bfloat16)
+        max_diff = (out.float() - out_ref.float()).abs().max().item()
+
+    for _ in range(warmup):
+        _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal)
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal)
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end) / rep
+    tflops = fwd_flops(batch, nheads, seqlen, HEAD_DIM, causal=causal) / ms / 1e9
+    return ms, tflops, max_diff
+
+
+def bench_bwd(batch, seqlen, nheads, nheads_kv, causal,
+              check_correctness=True, warmup=5, rep=30):
+    """Benchmark hd256 backward pass. Returns (ms, tflops, (dq_err, dk_err, dv_err) or error str)."""
+    q = torch.randn(batch, seqlen, nheads,    HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen, nheads_kv, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, seqlen, nheads_kv, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    scale = HEAD_DIM ** -0.5
+
+    try:
+        out, lse = _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, return_lse=True)
+        torch.cuda.synchronize()
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+    dout = torch.randn_like(out)
+
+    def fn():
+        return _flash_attn_bwd(q, k, v, out, dout, lse, softmax_scale=scale, causal=causal)
+
+    try:
+        with _suppress_stdout_stderr():
+            dq, dk, dv = fn()  # compile / warm JIT — suppresses kernel debug prints
+        torch.cuda.synchronize()
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+    # Gradient correctness vs PyTorch reference
+    grad_errs = None
+    if check_correctness:
+        gqa = nheads // nheads_kv
+        q_ref = q.float().detach().requires_grad_(True)
+        k_ref = k.float().detach().requires_grad_(True)
+        v_ref = v.float().detach().requires_grad_(True)
+        k_exp = k_ref.transpose(1, 2).repeat_interleave(gqa, dim=1)
+        v_exp = v_ref.transpose(1, 2).repeat_interleave(gqa, dim=1)
+        out_ref = F.scaled_dot_product_attention(
+            q_ref.transpose(1, 2), k_exp, v_exp, is_causal=causal, scale=scale
+        ).transpose(1, 2)
+        out_ref.backward(dout.float())
+        dq_err = (dq.float() - q_ref.grad).abs().max().item()
+        # dK/dV reference grads are summed over GQA groups; take mean per KV head
+        dk_ref = k_ref.grad
+        dv_ref = v_ref.grad
+        dk_err = (dk.float() - dk_ref).abs().max().item()
+        dv_err = (dv.float() - dv_ref).abs().max().item()
+        grad_errs = (dq_err, dk_err, dv_err)
+
+    with _suppress_stdout_stderr():
+        grads = (dq, dk, dv)
+        for _ in range(warmup):
+            grads = fn()
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    with _suppress_stdout_stderr():
+        for _ in range(rep):
+            grads = fn()
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end) / rep
+    tflops = bwd_flops(batch, nheads, seqlen, HEAD_DIM, causal=causal) / ms / 1e9
+    return ms, tflops, grad_errs
+
+
+def bench_varlen_fwd(total_len, doc_len, nheads, nheads_kv, causal,
+                     warmup=5, rep=30):
+    """Benchmark hd256 varlen forward with replicated fixed-length documents."""
+    q = torch.randn(total_len, nheads,    HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(total_len, nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(total_len, nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cu_seqlens = make_replicated_cu_seqlens(total_len, doc_len)
+    scale = HEAD_DIM ** -0.5
+
+    def fn(return_lse=False):
+        return _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=doc_len,
+            max_seqlen_k=doc_len,
+            softmax_scale=scale,
+            causal=causal,
+            return_lse=return_lse,
+        )
+
+    try:
+        fn()
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+    for _ in range(warmup):
+        fn()
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end) / rep
+    tflops = varlen_flops(total_len, doc_len, nheads, HEAD_DIM, causal=causal) / ms / 1e9
+    return ms, tflops, None
+
+
+def bench_varlen_bwd(total_len, doc_len, nheads, nheads_kv, causal,
+                     warmup=5, rep=30):
+    """Benchmark hd256 varlen backward with replicated fixed-length documents."""
+    q = torch.randn(total_len, nheads,    HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(total_len, nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(total_len, nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cu_seqlens = make_replicated_cu_seqlens(total_len, doc_len)
+    scale = HEAD_DIM ** -0.5
+
+    try:
+        out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=doc_len,
+            max_seqlen_k=doc_len,
+            softmax_scale=scale,
+            causal=causal,
+            return_lse=True,
+        )
+        torch.cuda.synchronize()
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+    dout = torch.randn_like(out)
+
+    def fn():
+        return _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            softmax_scale=scale,
+            causal=causal,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=doc_len,
+            max_seqlen_k=doc_len,
+        )
+
+    try:
+        with _suppress_stdout_stderr():
+            grads = fn()
+        torch.cuda.synchronize()
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+    with _suppress_stdout_stderr():
+        for _ in range(warmup):
+            grads = fn()
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    with _suppress_stdout_stderr():
+        for _ in range(rep):
+            grads = fn()
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end) / rep
+    tflops = 2.5 * varlen_flops(total_len, doc_len, nheads, HEAD_DIM, causal=causal) / ms / 1e9
+    return ms, tflops, None
+
+
+def bench_sdpa_fwd(batch, seqlen, nheads, nheads_kv, causal, warmup=5, rep=30):
+    """PyTorch SDPA baseline for forward."""
+    scale = HEAD_DIM ** -0.5
+    gqa = nheads // nheads_kv
+    q = torch.randn(batch, nheads,    seqlen, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(batch, nheads_kv, seqlen, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(batch, nheads_kv, seqlen, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = k.repeat_interleave(gqa, dim=1)
+    v = v.repeat_interleave(gqa, dim=1)
+
+    for _ in range(warmup):
+        F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end) / rep
+    tflops = fwd_flops(batch, nheads, seqlen, HEAD_DIM, causal=causal) / ms / 1e9
+    return ms, tflops
+
+
+def bench_sdpa_bwd(batch, seqlen, nheads, nheads_kv, causal, warmup=5, rep=30):
+    """PyTorch SDPA baseline for backward (fwd+bwd via autograd)."""
+    scale = HEAD_DIM ** -0.5
+    gqa = nheads // nheads_kv
+
+    def make_inputs():
+        q = torch.randn(batch, nheads,    seqlen, HEAD_DIM, dtype=torch.bfloat16,
+                        device="cuda", requires_grad=True)
+        k = torch.randn(batch, nheads_kv, seqlen, HEAD_DIM, dtype=torch.bfloat16,
+                        device="cuda").repeat_interleave(gqa, dim=1).requires_grad_(True)
+        v = torch.randn(batch, nheads_kv, seqlen, HEAD_DIM, dtype=torch.bfloat16,
+                        device="cuda").repeat_interleave(gqa, dim=1).requires_grad_(True)
+        return q, k, v
+
+    q, k, v = make_inputs()
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+    dout = torch.randn_like(out)
+
+    def fn():
+        q_, k_, v_ = make_inputs()
+        o = F.scaled_dot_product_attention(q_, k_, v_, is_causal=causal, scale=scale)
+        o.backward(dout)
+
+    for _ in range(warmup):
+        fn()
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end) / rep
+    tflops = bwd_flops(batch, nheads, seqlen, HEAD_DIM, causal=causal) / ms / 1e9
+    return ms, tflops
+
+
+def bench_sdpa_varlen_fwd(total_len, doc_len, nheads, nheads_kv, causal, warmup=5, rep=30):
+    """PyTorch SDPA baseline for fixed-length replicated varlen documents."""
+    return bench_sdpa_fwd(total_len // doc_len, doc_len, nheads, nheads_kv, causal, warmup, rep)
+
+
+def bench_sdpa_varlen_bwd(total_len, doc_len, nheads, nheads_kv, causal, warmup=5, rep=30):
+    """PyTorch SDPA backward baseline for fixed-length replicated varlen documents."""
+    return bench_sdpa_bwd(total_len // doc_len, doc_len, nheads, nheads_kv, causal, warmup, rep)
+
+
+# ── Formatting helpers ─────────────────────────────────────────────────────
+
+def fmt_tflops_mfu(tflops, peak_flops, width=18):
+    """Format TFLOPS with optional MFU% as a single string, e.g. '1373.3(61.0%)'."""
+    if peak_flops is not None:
+        mfu = tflops * 1e12 / peak_flops * 100
+        cell = f"{tflops:.1f}({mfu:.1f}%)"
+    else:
+        cell = f"{tflops:.1f}"
+    return f"{cell:>{width}}"
+
+
+def fmt_gap(fa_tflops, sdpa_tflops):
+    return f"{(fa_tflops / sdpa_tflops - 1.0) * 100:+.1f}%"
+
+
+# ── Run modes ──────────────────────────────────────────────────────────────
+
+def run_default(args, peak_flops=None, suite_label=None, check_correctness=True):
+    directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
+    causals = [True] if args.causal_only else ([False] if args.non_causal_only else [False, True])
+    has_mfu = peak_flops is not None
+    suite_label = suite_label or f"dense_h{args.nheads}_kv{args.nheads_kv}"
+
+    for direction in directions:
+        dir_label = "Forward" if direction == "fwd" else "Backward"
+
+        tflops_col = f"{IMPL_LABEL} TFLOPS(MFU%)" if has_mfu else "Throughput (TFLOPS)"
+        tflops_w = max(len(tflops_col), 18)
+
+        if direction == "fwd":
+            hdr = (f"{'Config (attn-mask / seqlen)':<30} {'Batch':>6} "
+                   f"{'Latency (ms)':>14} {tflops_col:>{tflops_w}} {'Max Abs Err (bf16)':>19}")
+        else:
+            hdr = (f"{'Config (attn-mask / seqlen)':<30} {'Batch':>6} "
+                   f"{'Latency (ms)':>14} {tflops_col:>{tflops_w}} "
+                   f"{'dQ Err':>10} {'dK Err':>10} {'dV Err':>10}")
+
+        width = len(hdr)
+        print(f"\n{'=' * width}")
+        print(f"  SM100 Blackwell  head_dim=256  {IMPL_LABEL}  {dir_label}  "
+              f"suite={suite_label}  nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
+        print(f"{'=' * width}")
+        print(hdr)
+        print("-" * width)
+
+        for seqlen in args.seqlen:
+            batch = auto_batch(seqlen, args.batch)
+            for causal in causals:
+                mask_label = "causal" if causal else "non-causal"
+                row_name = f"{mask_label} / seqlen={seqlen}"
+
+                if direction == "fwd":
+                    ms, tflops, diff = bench_fwd(
+                        batch, seqlen, args.nheads, args.nheads_kv, causal,
+                        check_correctness=check_correctness,
+                        warmup=args.warmup, rep=args.rep,
+                    )
+                    if ms is not None:
+                        line = (f"{row_name:<30} {batch:>6} {ms:>14.3f} "
+                                f"{fmt_tflops_mfu(tflops, peak_flops, tflops_w)}")
+                        if diff is not None:
+                            line += f" {diff:>19.6f}"
+                        print(line)
+                    else:
+                        print(f"{row_name:<30} {batch:>6} {'FAIL':>14}  {diff}")
+                else:
+                    ms, tflops, grad_errs = bench_bwd(
+                        batch, seqlen, args.nheads, args.nheads_kv, causal,
+                        check_correctness=check_correctness,
+                        warmup=args.warmup, rep=args.rep,
+                    )
+                    if ms is not None:
+                        line = (f"{row_name:<30} {batch:>6} {ms:>14.3f} "
+                                f"{fmt_tflops_mfu(tflops, peak_flops, tflops_w)}")
+                        if grad_errs is not None:
+                            dq_e, dk_e, dv_e = grad_errs
+                            line += f" {dq_e:>10.6f} {dk_e:>10.6f} {dv_e:>10.6f}"
+                        print(line)
+                    else:
+                        print(f"{row_name:<30} {batch:>6} {'FAIL':>14}  {grad_errs}")
+
+
+def run_varlen(args, peak_flops=None, suite_label=None):
+    directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
+    causals = [True] if args.causal_only else ([False] if args.non_causal_only else [False, True])
+    has_mfu = peak_flops is not None
+    suite_label = suite_label or f"varlen_h{args.nheads}_kv{args.nheads_kv}"
+
+    for direction in directions:
+        dir_label = "Forward" if direction == "fwd" else "Backward"
+
+        tflops_col = f"{IMPL_LABEL} TFLOPS(MFU%)" if has_mfu else "Throughput (TFLOPS)"
+        tflops_w = max(len(tflops_col), 18)
+        hdr = (f"{'Config (attn-mask / total doc)':<38} {'Docs':>6} "
+               f"{'Latency (ms)':>14} {tflops_col:>{tflops_w}}")
+
+        width = len(hdr)
+        print(f"\n{'=' * width}")
+        print(f"  SM100 Blackwell  head_dim=256  {IMPL_LABEL}  {dir_label}  "
+              f"suite={suite_label}  nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
+        print(f"{'=' * width}")
+        print(hdr)
+        print("-" * width)
+
+        for total_len in args.seqlen:
+            for doc_len in varlen_doc_lens_for_total(total_len, args.varlen_doc_lens):
+                docs = total_len // doc_len
+                for causal in causals:
+                    mask_label = "causal" if causal else "non-causal"
+                    row_name = f"{mask_label} / total={total_len} doc={doc_len}"
+
+                    if direction == "fwd":
+                        ms, tflops, err = bench_varlen_fwd(
+                            total_len, doc_len, args.nheads, args.nheads_kv, causal,
+                            warmup=args.warmup, rep=args.rep,
+                        )
+                    else:
+                        ms, tflops, err = bench_varlen_bwd(
+                            total_len, doc_len, args.nheads, args.nheads_kv, causal,
+                            warmup=args.warmup, rep=args.rep,
+                        )
+
+                    if ms is not None:
+                        print(f"{row_name:<38} {docs:>6} {ms:>14.3f} "
+                              f"{fmt_tflops_mfu(tflops, peak_flops, tflops_w)}")
+                    else:
+                        print(f"{row_name:<38} {docs:>6} {'FAIL':>14}  {err}")
+
+
+def run_gate(args, peak_flops=None):
+    for suite_label, nheads, nheads_kv in GATE_HEAD_CONFIGS:
+        args.nheads = nheads
+        args.nheads_kv = nheads_kv
+        run_default(args, peak_flops=peak_flops, suite_label=suite_label, check_correctness=False)
+
+    for suite_label, nheads, nheads_kv in GATE_VARLEN_HEAD_CONFIGS:
+        args.nheads = nheads
+        args.nheads_kv = nheads_kv
+        run_varlen(args, peak_flops=peak_flops, suite_label=suite_label)
+
+
+def run_sdpa_default(args, peak_flops=None, suite_label=None):
+    directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
+    causals = [True] if args.causal_only else ([False] if args.non_causal_only else [False, True])
+    suite_label = suite_label or f"dense_h{args.nheads}_kv{args.nheads_kv}"
+
+    for direction in directions:
+        dir_label = "Forward" if direction == "fwd" else "Backward"
+        hdr = (f"{'Config (attn-mask / seqlen)':<30} {'Batch':>6} "
+               f"{'SDPA ms':>10} {'SDPA TFLOPS':>12}")
+        width = len(hdr)
+        print(f"\n{'=' * width}")
+        print(f"  PyTorch SDPA  head_dim=256  {dir_label}  "
+              f"suite={suite_label}  nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
+        print(f"{'=' * width}")
+        print(hdr)
+        print("-" * width)
+
+        for seqlen in args.seqlen:
+            batch = auto_batch(seqlen, args.batch)
+            for causal in causals:
+                mask_label = "causal" if causal else "non-causal"
+                row_name = f"{mask_label} / seqlen={seqlen}"
+                if direction == "fwd":
+                    ms, tflops = bench_sdpa_fwd(
+                        batch, seqlen, args.nheads, args.nheads_kv, causal,
+                        warmup=args.warmup, rep=args.rep,
+                    )
+                else:
+                    ms, tflops = bench_sdpa_bwd(
+                        batch, seqlen, args.nheads, args.nheads_kv, causal,
+                        warmup=args.warmup, rep=args.rep,
+                    )
+                print(f"{row_name:<30} {batch:>6} {ms:>10.3f} {tflops:>12.1f}")
+
+
+def run_sdpa_varlen(args, peak_flops=None, suite_label=None):
+    directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
+    causals = [True] if args.causal_only else ([False] if args.non_causal_only else [False, True])
+    suite_label = suite_label or f"varlen_h{args.nheads}_kv{args.nheads_kv}"
+
+    for direction in directions:
+        dir_label = "Forward" if direction == "fwd" else "Backward"
+        hdr = (f"{'Config (attn-mask / total doc)':<38} {'Docs':>6} "
+               f"{'SDPA ms':>10} {'SDPA TFLOPS':>12}")
+        width = len(hdr)
+        print(f"\n{'=' * width}")
+        print(f"  PyTorch SDPA  head_dim=256  {dir_label}  "
+              f"suite={suite_label}  nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
+        print(f"{'=' * width}")
+        print(hdr)
+        print("-" * width)
+
+        for total_len in args.seqlen:
+            for doc_len in varlen_doc_lens_for_total(total_len, args.varlen_doc_lens):
+                docs = total_len // doc_len
+                for causal in causals:
+                    mask_label = "causal" if causal else "non-causal"
+                    row_name = f"{mask_label} / total={total_len} doc={doc_len}"
+                    if direction == "fwd":
+                        ms, tflops = bench_sdpa_varlen_fwd(
+                            total_len, doc_len, args.nheads, args.nheads_kv, causal,
+                            warmup=args.warmup, rep=args.rep,
+                        )
+                    else:
+                        ms, tflops = bench_sdpa_varlen_bwd(
+                            total_len, doc_len, args.nheads, args.nheads_kv, causal,
+                            warmup=args.warmup, rep=args.rep,
+                        )
+                    print(f"{row_name:<38} {docs:>6} {ms:>10.3f} {tflops:>12.1f}")
+
+
+def run_sdpa_gate(args, peak_flops=None):
+    for suite_label, nheads, nheads_kv in GATE_HEAD_CONFIGS:
+        args.nheads = nheads
+        args.nheads_kv = nheads_kv
+        run_sdpa_default(args, peak_flops=peak_flops, suite_label=suite_label)
+
+    for suite_label, nheads, nheads_kv in GATE_VARLEN_HEAD_CONFIGS:
+        args.nheads = nheads
+        args.nheads_kv = nheads_kv
+        run_sdpa_varlen(args, peak_flops=peak_flops, suite_label=suite_label)
+
+
+def run_compare_sdpa(args, peak_flops=None):
+    """Compare FA hd256 forward vs PyTorch SDPA."""
+    causals = [True] if args.causal_only else ([False] if args.non_causal_only else [False, True])
+    has_mfu = peak_flops is not None
+
+    tflops_col = "FA4 TFLOPS(MFU%)" if has_mfu else "FA TFLOPS"
+    tflops_w = max(len(tflops_col), 18)
+
+    hdr = (f"{'Config (attn-mask / seqlen)':<30} {'Batch':>6} "
+           f"{'FA Latency (ms)':>16} {tflops_col:>{tflops_w}} "
+           f"{'SDPA Latency (ms)':>18} {'SDPA TFLOPS':>12} {'Speedup':>8}")
+    width = len(hdr)
+
+    print(f"\n{'=' * width}")
+    print(f"  SM100 Blackwell  head_dim=256  Forward:  FA 2CTA  vs  PyTorch SDPA  "
+          f"nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
+    print(f"{'=' * width}")
+    print(hdr)
+    print("-" * width)
+
+    for seqlen in args.seqlen:
+        batch = auto_batch(seqlen, args.batch)
+        for causal in causals:
+            mask_label = "causal" if causal else "non-causal"
+            row_name = f"{mask_label} / seqlen={seqlen}"
+
+            fa_ms, fa_tflops, diff = bench_fwd(
+                batch, seqlen, args.nheads, args.nheads_kv, causal,
+                check_correctness=False, warmup=args.warmup, rep=args.rep,
+            )
+            sdpa_ms, sdpa_tflops = bench_sdpa_fwd(
+                batch, seqlen, args.nheads, args.nheads_kv, causal,
+                warmup=args.warmup, rep=args.rep,
+            )
+            if fa_ms is not None:
+                speedup = sdpa_ms / fa_ms
+                line = (f"{row_name:<30} {batch:>6} {fa_ms:>16.3f} "
+                        f"{fmt_tflops_mfu(fa_tflops, peak_flops, tflops_w)} "
+                        f"{sdpa_ms:>18.3f} {sdpa_tflops:>12.1f} {speedup:>7.2f}x")
+                print(line)
+            else:
+                print(f"{row_name:<30} {batch:>6} {'FAIL':>16}  {fa_tflops}")
+
+
+def run_compare_baseline(args, peak_flops=None):
+    """Full fwd+bwd comparison: FA hd256 2CTA vs PyTorch SDPA (the only viable baseline,
+    since FA4 main does not support head_dim=256 on SM100).
+    """
+    causals = [True] if args.causal_only else ([False] if args.non_causal_only else [False, True])
+    has_mfu = peak_flops is not None
+
+    for direction, flops_fn, fa_bench_fn, sdpa_bench_fn in [
+        ("Forward",  fwd_flops, bench_fwd,
+         lambda b, s, nh, nhkv, c, **kw: bench_sdpa_fwd(b, s, nh, nhkv, c, **kw)),
+        ("Backward", bwd_flops, bench_bwd,
+         lambda b, s, nh, nhkv, c, **kw: bench_sdpa_bwd(b, s, nh, nhkv, c, **kw)),
+    ]:
+        tflops_col = "FA4 TFLOPS(MFU%)" if has_mfu else "FA TFLOPS"
+        tflops_w = max(len(tflops_col), 18)
+
+        hdr = (f"{'Config (attn-mask / seqlen)':<30} {'Batch':>6} "
+               f"{'FA ms':>8} {tflops_col:>{tflops_w}} "
+               f"{'SDPA ms':>9} {'SDPA TFLOPS':>12} {'Speedup':>8}")
+        width = len(hdr)
+
+        print(f"\n{'=' * width}")
+        print(f"  FA hd256 2CTA  vs  PyTorch SDPA  [{direction}]  "
+              f"nheads={args.nheads}  nheads_kv={args.nheads_kv}  (rep={args.rep})")
+        print(f"  NOTE: FA4 main does not support head_dim=256; SDPA is the only baseline.")
+        print(f"{'=' * width}")
+        print(hdr)
+        print("-" * width)
+
+        for seqlen in args.seqlen:
+            batch = auto_batch(seqlen, args.batch)
+            for causal in causals:
+                mask_label = "causal" if causal else "non-causal"
+                row_name = f"{mask_label} / seqlen={seqlen}"
+
+                fa_ms, fa_tflops, _ = fa_bench_fn(
+                    batch, seqlen, args.nheads, args.nheads_kv, causal,
+                    check_correctness=False, warmup=args.warmup, rep=args.rep,
+                )
+                sdpa_ms, sdpa_tflops = sdpa_bench_fn(
+                    batch, seqlen, args.nheads, args.nheads_kv, causal,
+                    warmup=args.warmup, rep=args.rep,
+                )
+
+                if fa_ms is not None:
+                    speedup = sdpa_ms / fa_ms
+                    line = (f"{row_name:<30} {batch:>6} {fa_ms:>8.3f} "
+                            f"{fmt_tflops_mfu(fa_tflops, peak_flops, tflops_w)} "
+                            f"{sdpa_ms:>9.3f} {sdpa_tflops:>12.1f} {speedup:>7.2f}x")
+                    print(line)
+                else:
+                    print(f"{row_name:<30} {batch:>6} {'FAIL':>8}  {fa_tflops}")
+
+
+def run_compile_only(args):
+    """Trigger JIT compilation without timing — useful for two-pass workflow."""
+    causals = [False, True]
+    print("Compiling hd256 2CTA kernels (fwd + bwd) ...")
+    for seqlen in args.seqlen:
+        batch = auto_batch(seqlen, args.batch)
+        for causal in causals:
+            # fwd
+            q = torch.randn(batch, seqlen, args.nheads,    HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+            k = torch.randn(batch, seqlen, args.nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+            v = torch.randn(batch, seqlen, args.nheads_kv, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+            scale = HEAD_DIM ** -0.5
+            try:
+                out, lse = _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, return_lse=True)
+                dout = torch.randn_like(out)
+                _flash_attn_bwd(q, k, v, out, dout, lse, softmax_scale=scale, causal=causal)
+                print(f"  compiled  causal={causal}  seqlen={seqlen}  batch={batch}")
+            except Exception as e:
+                print(f"  FAILED    causal={causal}  seqlen={seqlen}  batch={batch}  {e}")
+    print("Done.")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SM100 head_dim=256 2CTA attention benchmark",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--direction", choices=["fwd", "bwd", "both"], default="both")
+    parser.add_argument(
+        "--suite",
+        choices=["dense", "varlen", "gate"],
+        default="dense",
+        help="Benchmark suite: dense, varlen, or the full gate matrix",
+    )
+    parser.add_argument(
+        "--seqlen", type=csv_ints, default=[1024, 2048, 4096, 8192, 16384, 32768],
+        help="Comma-separated sequence lengths (default: 1024,2048,4096,8192,16384,32768)",
+    )
+    parser.add_argument(
+        "--varlen-doc-lens", type=csv_ints, default=None,
+        help="Optional fixed document lengths for varlen suites. Default: powers of two from 128 through each total length.",
+    )
+    parser.add_argument("--batch", type=int, default=0,
+                        help="Batch size (0 = auto ~64k tokens)")
+    parser.add_argument("--nheads",    type=int, default=NHEADS)
+    parser.add_argument("--nheads-kv", type=int, default=NHEADS_KV, dest="nheads_kv")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--rep",    type=int, default=30)
+    parser.add_argument("--causal-only",     action="store_true")
+    parser.add_argument("--non-causal-only", action="store_true")
+    parser.add_argument("--compare-sdpa",     action="store_true",
+                        help="Compare FA hd256 fwd vs PyTorch SDPA")
+    parser.add_argument("--compare-baseline", action="store_true",
+                        help="Full fwd+bwd comparison vs PyTorch SDPA (the only viable "
+                             "baseline since FA4 main does not support head_dim=256)")
+    parser.add_argument("--compile-only",     action="store_true",
+                        help="Compile kernels without benchmarking (two-pass step 1)")
+    parser.add_argument("--sdpa-only",        action="store_true",
+                        help="Run only the PyTorch SDPA baseline for the selected suite")
+    parser.add_argument("--impl", choices=["fa4", "flash_moe", "bladnn_fa4"], default="fa4")
+    parser.add_argument(
+        "--flash-moe-src",
+        default=os.environ.get("FLASH_MOE_SRC"),
+        help="Path to flash-moe/src when --impl flash_moe",
+    )
+
+    args = parser.parse_args()
+    torch.manual_seed(0)
+    configure_impl(args.impl, args.flash_moe_src)
+    peak_flops = check_sm100()
+
+    if args.compile_only:
+        run_compile_only(args)
+    elif args.sdpa_only:
+        if args.suite == "gate":
+            run_sdpa_gate(args, peak_flops=peak_flops)
+        elif args.suite == "varlen":
+            run_sdpa_varlen(args, peak_flops=peak_flops)
+        else:
+            run_sdpa_default(args, peak_flops=peak_flops)
+    elif args.suite == "gate":
+        run_gate(args, peak_flops=peak_flops)
+    elif args.suite == "varlen":
+        run_varlen(args, peak_flops=peak_flops)
+    elif args.compare_baseline:
+        run_compare_baseline(args, peak_flops=peak_flops)
+    elif args.compare_sdpa:
+        run_compare_sdpa(args, peak_flops=peak_flops)
+    else:
+        run_default(args, peak_flops=peak_flops)
+
+
+if __name__ == "__main__":
+    main()
